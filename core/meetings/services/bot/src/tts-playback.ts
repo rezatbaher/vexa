@@ -26,6 +26,13 @@ function setTtsMute(muted: boolean, log: (m: string) => void): void {
   try {
     execSync(`pactl set-sink-mute tts_sink ${v}`, { stdio: 'pipe' });
     execSync(`pactl set-source-mute virtual_mic ${v}`, { stdio: 'pipe' });
+    if (!muted) {
+      // Unmuting for playback: force full mic level. PulseAudio's stream-restore can pin
+      // virtual_mic low (observed 58% / -14 dB) once Chromium connects, which made the injected
+      // speech inaudible in the meeting. Set it right before playback so it always wins.
+      execSync(`pactl set-sink-volume tts_sink 100%`, { stdio: 'pipe' });
+      execSync(`pactl set-source-volume virtual_mic 150%`, { stdio: 'pipe' });
+    }
   } catch (err) {
     log(`[tts] pactl ${muted ? 'mute' : 'unmute'} failed: ${(err as Error).message}`);
   }

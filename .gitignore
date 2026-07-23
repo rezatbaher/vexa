@@ -28,3 +28,6 @@ docs/views/*
 
 # transcription service downloaded model weights (runtime cache)
 deploy/transcription/models/
+
+# Pathwarden deploy secrets (never commit)
+.deploy-secrets.env

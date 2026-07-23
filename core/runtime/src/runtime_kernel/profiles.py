@@ -104,6 +104,10 @@ def default_registry() -> ProfileRegistry:
             "BOT_SPEAKER_CONFIRM_THRESHOLD",
             "BOT_SPEAKER_MAX_BUFFER_SEC",
             "BOT_SPEAKER_IDLE_TIMEOUT_SEC",
+            # Voice agent (Pathwarden): the bot's TTS service (speak act) reads these from its env —
+            # forward them from the runtime env so the speak act can synthesize (e.g. Kokoro).
+            "TTS_SERVICE_URL",
+            "TTS_API_TOKEN",
         )
         if os.environ.get(key, "").strip()
     }

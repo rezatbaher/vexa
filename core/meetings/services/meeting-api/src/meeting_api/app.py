@@ -194,6 +194,10 @@ def create_app(
     # workload (the leave command alone is fire-and-forget — a booting bot may never receive it → orphan).
     app.include_router(build_stop_router(meeting_repo, command_publisher, runtime))
 
+    # --- voice agent: speak/chat/screen → publish acts to bot_commands (Pathwarden add) ---
+    from .lifecycle.voice_router import build_voice_router
+    app.include_router(build_voice_router(meeting_repo, command_publisher))
+
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---
     if transcript_store is None:
         transcript_store = _collector_fakes().InMemoryTranscriptStore()

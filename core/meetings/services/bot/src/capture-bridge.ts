@@ -525,37 +525,43 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
   // Toggle the meeting-UI mic button so the bot is audible only while speaking (production
   // unmutes before speech + auto-mutes after — index.ts:1039–1059). The PulseAudio source
   // (tts_sink → virtual_mic) is the actual audio path and is provided by the VM image.
-  const setMic = async (on: boolean): Promise<void> => {
-    // Runs IN THE BROWSER; reach the DOM via globalThis (no DOM types in this Node-typed file).
-    await page.evaluate(({ on, platform }) => {
+  // Ensure the meeting-UI mic is UNMUTED — state-checked, NEVER a blind toggle. The audibility gate
+  // is the PulseAudio virtual_mic mute (tts-playback opens it only during playback), NOT this button.
+  // The old code toggled the button blindly on every speak: because the bot joins UNMUTED, that click
+  // MUTED the live mic for the exact playback window (then unmuted it after) → speech was silent.
+  // We now click ONLY when the control clearly reports the mic is currently OFF, and we never mute it
+  // back (the PA-level mute already keeps the bot silent between speaks).
+  const ensureMicUnmuted = async (): Promise<void> => {
+    await page.evaluate(({ platform }) => {
       const doc = (globalThis as any).document;
-      const click = (sel: string) => doc?.querySelector(sel)?.click();
-      if (platform === 'teams') click('#microphone-button');
-      else if (platform === 'zoom') click('.join-audio-container__btn');
+      const labelOf = (b: any) =>
+        (((b?.getAttribute?.('aria-label') || b?.getAttribute?.('data-tooltip') || '') as string)).toLowerCase();
+      // Only click when the label says the mic is OFF (→ clicking turns it ON). If we can't tell,
+      // do NOTHING — a bot that joined unmuted stays unmuted (correct), and we never mute a live mic.
+      const clickIfOff = (b: any) => { if (b && /turn on|unmute|mic is off|microphone is off/.test(labelOf(b))) b.click(); };
+      if (platform === 'teams') clickIfOff(doc?.querySelector('#microphone-button'));
+      else if (platform === 'zoom') clickIfOff(doc?.querySelector('.join-audio-container__btn'));
       else {
-        // Google Meet / Jitsi: the mic toggle is identified by its aria-label —
-        // "microphone" on Meet, "Toggle mute audio" on stock jitsi builds.
+        // Google Meet / Jitsi: the mic toggle is identified by its aria-label.
         const btn = Array.from(doc?.querySelectorAll('[role="button"],button') ?? [])
-          .find((b: any) => /microphone|mute audio/i.test(b.getAttribute('aria-label') ?? '')) as any;
-        btn?.click();
+          .find((b: any) => /microphone|mute audio/i.test((b as any).getAttribute('aria-label') ?? '')) as any;
+        clickIfOff(btn);
       }
-      void on; // toggle is a click; on/off intent is logged by the caller
-    }, { on, platform }).catch(() => { /* L4: best-effort UI drive */ });
+    }, { platform }).catch(() => { /* best-effort UI drive */ });
   };
 
   return {
     async speak(text: string, voice?: string): Promise<void> {
       if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return; }
       console.log(`[bot] speak: "${text.slice(0, 60)}"`);
-      await setMic(true);                                     // (a) unmute the meeting-UI mic button
-      // (b) synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
+      await ensureMicUnmuted();                               // (a) make sure the UI mic is ON (never mutes a live mic)
+      // (b) synthesize via the TTS service + stream PCM to tts_sink → virtual_mic; audibility is gated
+      //     at the PA level (virtual_mic mute) inside tts.speak, so the UI mic just stays on.
       await tts.speak(text, voice).catch((e) => console.error(`[bot] speak: tts failed: ${String(e)}`));
-      await setMic(false);                                    // (c) re-mute after the tail
     },
     async stop(): Promise<void> {
       if (!enabled) return;
-      tts.stop();                                             // barge-in: kill playback + re-mute tts_sink
-      await setMic(false);
+      tts.stop();                                             // barge-in: kill playback + re-mute tts_sink (PA-level)
       console.log('[bot] speak_stop');
     },
   };

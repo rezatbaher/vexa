@@ -32,6 +32,7 @@ pactl load-module module-null-sink sink_name=tts_sink \
 pactl load-module module-remap-source master=tts_sink.monitor source_name=virtual_mic \
   source_properties=device.description="VirtualMicrophone" 2>/dev/null || true
 pactl set-default-source virtual_mic 2>/dev/null || true
+pactl set-source-volume virtual_mic 150% 2>/dev/null || true  # Pathwarden: full mic level (stream-restore pins it low otherwise → inaudible speak)
 pactl set-sink-mute tts_sink 1 2>/dev/null || true
 pactl set-source-mute virtual_mic 1 2>/dev/null || true
 

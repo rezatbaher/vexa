@@ -138,6 +138,7 @@ def build_invocation(
     connection_id: str,
     language: Optional[str] = None,
     task: Optional[str] = None,
+    voice_agent_enabled: bool = False,
     transcription_tier: str = "realtime",
     redis_url: str,
     automatic_leave: Optional[dict] = None,
@@ -174,6 +175,9 @@ def build_invocation(
         "redisUrl": redis_url,
         "language": language,
         "task": task,
+        # Pathwarden: gate the acts.v1 voice commands (speak/…). Only emitted when True so
+        # non-voice invocations stay byte-identical (None is stripped below).
+        "voiceAgentEnabled": voice_agent_enabled or None,
         "transcriptionTier": transcription_tier,
         "transcribeEnabled": transcribe_enabled,
         "transcriptionServiceUrl": transcription_service_url,

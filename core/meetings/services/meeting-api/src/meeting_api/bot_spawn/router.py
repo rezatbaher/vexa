@@ -297,6 +297,7 @@ def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
                 meeting_url=meeting_url,
                 language=body.get("language"),
                 task=body.get("task"),
+                voice_agent_enabled=bool(body.get("voice_agent_enabled", False)),
                 transcription_tier=body.get("transcription_tier", "realtime"),
                 recording_enabled=_resolve_recording_enabled(body.get("recording_enabled")),
                 transcribe_enabled=transcribe_enabled,
