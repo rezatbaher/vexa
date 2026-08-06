@@ -13,8 +13,13 @@ The bot (spawned with ``voice_agent_enabled=true``) executes the act:
   * ``speak`` / ``speak_stop`` — IMPLEMENTED in the bot today. Speech is synthesized by the bot via
     ``TTS_SERVICE_URL`` (OpenAI-compatible ``POST /v1/audio/speech``, PCM) — point that env at a
     Kokoro-FastAPI instance and the agent speaks in the meeting with your own TTS voice.
-  * ``chat_send`` / ``screen_show`` / ``screen_stop`` — the command is published; the bot's DOM
-    handler for these is a follow-up (the act is currently ignored by the bot's voice handler).
+  * ``chat_send`` — IMPLEMENTED in the bot (``capture-bridge`` ``sendChat`` drives the meeting's
+    chat panel via the DOM: open the panel, set the input through the native value setter so React
+    registers it, then click Send / press Enter). Best-effort by nature — the selectors are
+    Meet/Jitsi-shaped and a UI change upstream can break them, so it logs and gives up rather than
+    failing the act.
+  * ``screen_show`` / ``screen_stop`` — the command is published; the bot's DOM handler for these
+    is still a follow-up (the act is currently ignored by the bot's voice handler).
 
 This route only TRIGGERS the act (fire-and-forget over redis); it never mutates the FSM. A meeting
 that isn't active (or wasn't spawned voice-enabled) → 404.

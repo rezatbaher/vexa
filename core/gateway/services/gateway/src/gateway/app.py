@@ -331,6 +331,12 @@ def create_app(
     async def speak(platform: str, native_meeting_id: str, request: Request):
         return await _forward("POST", _meeting(f"/bots/{platform}/{native_meeting_id}/speak"), request)
 
+    # Pathwarden: forward chat-SEND (the open-core gateway only had GET /chat = read). meeting-api's
+    # voice_router publishes the chat_send act; same /bots scope as speak.
+    @app.post("/bots/{platform}/{native_meeting_id}/chat")
+    async def chat_send(platform: str, native_meeting_id: str, request: Request):
+        return await _forward("POST", _meeting(f"/bots/{platform}/{native_meeting_id}/chat"), request)
+
     # P0 (cross-tenant leak fix): the by-ROW-id transcript read the terminal uses to fetch EXACTLY the
     # row it displays (owner-scoped downstream). Registered BEFORE the native route so `by-id` is not
     # matched as a {platform}. Forwarded verbatim; the auth/identity prep (X-User-Id) is shared.
@@ -444,7 +450,8 @@ def create_app(
 
     # native-keyed chat READ (#579 C3): the sealed api.v1 GET the 0.10 dashboard's chat panel calls.
     # Thin passthrough to meeting-api's honest empty-list restore (0.12 does not persist in-meeting
-    # chat server-side). The POST (send) half is a SIGNED GAP — no bot-command backend in 0.12.
+    # chat server-side). The POST (send) half is no longer a gap in this fork — it is forwarded
+    # above and the bot drives the chat panel via the DOM (see capture-bridge `sendChat`).
     @app.get("/bots/{platform}/{native_meeting_id}/chat")
     async def read_meeting_chat(platform: str, native_meeting_id: str, request: Request):
         return await _forward("GET", _meeting(f"/bots/{platform}/{native_meeting_id}/chat"), request)

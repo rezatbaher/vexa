@@ -515,6 +515,8 @@ export interface SpeakController {
   speak(text: string, voice?: string): Promise<void>;
   /** Stop any in-flight speech (barge-in). */
   stop(): Promise<void>;
+  /** Post `text` into the meeting's chat panel (acts.v1 `chat_send`). Best-effort DOM drive. */
+  sendChat(text: string): Promise<void>;
 }
 
 export function createSpeakController(page: Page, inv: Invocation): SpeakController {
@@ -563,6 +565,56 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
       if (!enabled) return;
       tts.stop();                                             // barge-in: kill playback + re-mute tts_sink (PA-level)
       console.log('[bot] speak_stop');
+    },
+    async sendChat(text: string): Promise<void> {
+      if (!enabled) { console.error('[bot] chat_send ignored: voiceAgentEnabled is false'); return; }
+      console.log(`[bot] chat_send: "${text.slice(0, 60)}"`);
+      // Post into the meeting chat via the DOM (no server-side chat backend in the core). Best-effort:
+      // open the chat panel if needed, set the input value (native setter so React picks it up),
+      // then click Send or press Enter. Meet/Jitsi use an aria-labelled textarea; Teams/Zoom differ.
+      // NB: DOM type names (Document/HTMLElement/KeyboardEvent/…) are NOT available here — the bot
+      // compiles with `lib: ["ES2022"]` and no `dom` lib (tsconfig.base.json), so referencing them
+      // is a TS2304 build failure. Every evaluate block in this file therefore reaches the browser
+      // through `(globalThis as any)`; keep that idiom.
+      await page.evaluate(async ({ text }) => {
+        const g = (globalThis as any);
+        const doc = g.document;
+        if (!doc) return;
+        const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+        const findInput = (): any =>
+          doc.querySelector('textarea[aria-label*="message" i]')
+          || doc.querySelector('textarea[placeholder*="message" i]')
+          || doc.querySelector('div[contenteditable="true"][aria-label*="message" i]')
+          || doc.querySelector('textarea');
+        const byLabel = (re: RegExp): any =>
+          (Array.from(doc.querySelectorAll('[role="button"],button')) as any[])
+            .find((b) => re.test((b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || '')));
+        let input = findInput();
+        if (!input) {
+          byLabel(/chat with everyone|open chat|^chat$|messages/i)?.click();   // open the panel
+          await sleep(700);
+          input = findInput();
+        }
+        if (!input) { console.error('[bot] chat_send: no chat input found'); return; }
+        input.focus();
+        const tag = input.tagName;
+        if (tag === 'TEXTAREA' || tag === 'INPUT') {
+          // Native value setter, so React's onChange actually fires (a bare `.value =` is swallowed).
+          const proto = tag === 'TEXTAREA' ? g.HTMLTextAreaElement.prototype : g.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(input, text); else input.value = text;
+          input.dispatchEvent(new g.Event('input', { bubbles: true }));
+        } else {
+          input.textContent = text;
+          input.dispatchEvent(new g.Event('input', { bubbles: true }));
+        }
+        await sleep(200);
+        const send = byLabel(/send a message|send message|^send$/i);
+        if (send && !send.disabled) { send.click(); return; }
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+          input.dispatchEvent(new g.KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+        }
+      }, { text }).catch((e: unknown) => console.error(`[bot] chat_send failed: ${String(e)}`));
     },
   };
 }

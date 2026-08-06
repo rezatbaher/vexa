@@ -116,12 +116,14 @@ function teeActs(source: ActsSource, voice: (act: Act) => void | Promise<void>):
   };
 }
 
-/** The bot's voice-act handler: route acts.v1 speak / speak_stop to the SpeakController. The
- *  other voice acts (chat/screen/avatar) are out of this increment's scope. */
+/** The bot's voice-act handler: route acts.v1 speak / speak_stop / chat_send to the
+ *  SpeakController. The remaining voice acts (screen/avatar) are still out of scope — meeting-api
+ *  publishes them, but the bot has no handler, so they are silently dropped here. */
 function voiceHandler(speak: SpeakController): (act: Act) => Promise<void> {
   return async (act) => {
     if (act.action === 'speak') await speak.speak(act.text, act.voice);
     else if (act.action === 'speak_stop') await speak.stop();
+    else if (act.action === 'chat_send') await speak.sendChat(act.text);
   };
 }
 
