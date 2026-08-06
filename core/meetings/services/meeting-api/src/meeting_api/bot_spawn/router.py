@@ -305,6 +305,9 @@ def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
                 # has no additionalProperties:false), so the wire is not rejected; documenting it as
                 # a public typed field needs a vN+1 (lane:contract) — see the bot_spawn README.
                 continue_meeting=bool(body.get("continue_meeting", False)),
+                # pathwarden patch: thread the (already-accepted, previously-ignored)
+                # automatic_leave through so a client can widen the lobby wait.
+                automatic_leave=body.get("automatic_leave"),
                 max_concurrent=max_concurrent,
                 webhook_url=x_user_webhook_url,
                 webhook_secret=x_user_webhook_secret,

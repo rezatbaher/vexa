@@ -93,6 +93,46 @@ async def _resolve_transcription_backend(user_id: int) -> dict:
         return {}
 
 
+# pathwarden patch — caller-tunable automatic_leave.
+#
+# A human-in-the-loop join needs a forgiving lobby window: the host has to notice and Admit the
+# guest, and "I was mid-sentence in another call" routinely costs more than the 10 minutes this
+# was hardcoded to. The invocation.v1 contract already carries these three keys; nothing on the
+# spawn path read them off the request, so a client tuning the lobby wait was silently ignored.
+#
+# Accepts the invocation.v1 camelCase keys AND the hosted-API snake_case aliases, so a client
+# written against either naming works. Unknown keys, non-integers and out-of-range values are
+# dropped rather than passed through — this feeds a bot's own leave timers, and a bogus value
+# there strands a container.
+_AUTOMATIC_LEAVE_DEFAULTS = {"waitingRoomTimeout": 600000, "everyoneLeftTimeout": 900000}
+_AUTOMATIC_LEAVE_ALIASES = {
+    "max_wait_for_admission": "waitingRoomTimeout",
+    "waitingroomtimeout": "waitingRoomTimeout",
+    "max_time_left_alone": "everyoneLeftTimeout",
+    "everyonelefttimeout": "everyoneLeftTimeout",
+    "no_one_joined_timeout": "noOneJoinedTimeout",
+    "noonejoinedtimeout": "noOneJoinedTimeout",
+}
+_AUTOMATIC_LEAVE_MAX_MS = 6 * 60 * 60 * 1000  # 6h — above the bot's own 4h active-phase backstop
+
+
+def resolve_automatic_leave(requested: Optional[dict]) -> dict:
+    """Merge a caller's ``automatic_leave`` over the spawn defaults, per key."""
+    out = dict(_AUTOMATIC_LEAVE_DEFAULTS)
+    if not isinstance(requested, dict):
+        return out
+    for raw_key, raw_val in requested.items():
+        key = _AUTOMATIC_LEAVE_ALIASES.get(str(raw_key).strip().lower(), str(raw_key).strip())
+        if key not in ("waitingRoomTimeout", "everyoneLeftTimeout", "noOneJoinedTimeout"):
+            continue
+        # bool is an int subclass — reject it explicitly or `True` becomes a 1ms timeout.
+        if isinstance(raw_val, bool) or not isinstance(raw_val, int):
+            continue
+        if 0 < raw_val <= _AUTOMATIC_LEAVE_MAX_MS:
+            out[key] = raw_val
+    return out
+
+
 def construct_meeting_url(platform: str, native_meeting_id: str) -> Optional[str]:
     """Best-effort meeting URL for ``(platform, native_id)`` (zoom needs more than the id →
     None; the caller may pass an explicit ``meeting_url`` instead)."""
@@ -157,6 +197,10 @@ async def request_bot(
     webhook_url: Optional[str] = None,
     webhook_secret: Optional[str] = None,
     webhook_events: Optional[dict] = None,
+    # pathwarden patch: honour a caller-supplied automatic_leave. MeetingCreate has always ACCEPTED
+    # this field (the body is an open dict) but nothing read it, so the lobby window was pinned at
+    # the hardcoded 10 minutes and any client tuning it was silently ignored.
+    automatic_leave: Optional[dict] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -386,8 +430,9 @@ async def request_bot(
         s3_access_key=auth_s3.get("s3_access_key"),
         s3_secret_key=auth_s3.get("s3_secret_key"),
         # A human-in-the-loop dashboard join needs a forgiving lobby window so a late admit does not
-        # fail the meeting; everyoneLeftTimeout matches the O6 config.
-        automatic_leave={"waitingRoomTimeout": 600000, "everyoneLeftTimeout": 900000},
+        # fail the meeting; everyoneLeftTimeout matches the O6 config. A caller-supplied
+        # `automatic_leave` on the request body overrides these per key (pathwarden patch).
+        automatic_leave=resolve_automatic_leave(automatic_leave),
     )
 
     # 5. Spawn over runtime.v1.
