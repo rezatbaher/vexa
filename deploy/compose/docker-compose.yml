@@ -20,7 +20,16 @@ services:
       retries: 5
     volumes:
       - redis-data:/data
-    networks: [vexa]
+    # ⚠️ UNIQUE alias. `redis` / `postgres` are the most-used service names in the world, so any
+    # container of this stack that is ALSO attached to another compose network (Pathwarden attaches
+    # gateway/meeting-api/runtime/admin-api to `pathwarden_network`) resolves the short name to
+    # WHICHEVER network answers first — and gets the other stack's datastore. Measured 2026-08-25:
+    # all four resolved `redis` and `postgres` to Pathwarden's, so every fan-in subscribe died with
+    # AuthenticationError while the socket still acked `subscribed`. Services survived only because
+    # they had connected 35 days earlier, before the attach; any restart would have repointed them.
+    networks:
+      vexa:
+        aliases: [vexa-redis]
     restart: unless-stopped
 
   postgres:
@@ -43,7 +52,16 @@ services:
       retries: 5
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    networks: [vexa]
+    # ⚠️ UNIQUE alias. `redis` / `postgres` are the most-used service names in the world, so any
+    # container of this stack that is ALSO attached to another compose network (Pathwarden attaches
+    # gateway/meeting-api/runtime/admin-api to `pathwarden_network`) resolves the short name to
+    # WHICHEVER network answers first — and gets the other stack's datastore. Measured 2026-08-25:
+    # all four resolved `redis` and `postgres` to Pathwarden's, so every fan-in subscribe died with
+    # AuthenticationError while the socket still acked `subscribed`. Services survived only because
+    # they had connected 35 days earlier, before the attach; any restart would have repointed them.
+    networks:
+      vexa:
+        aliases: [vexa-postgres]
     restart: unless-stopped
 
   minio:
@@ -91,7 +109,7 @@ services:
     ports:
       - "127.0.0.1:${ADMIN_API_PORT:-18057}:8001"
     environment:
-      - DB_HOST=postgres
+      - DB_HOST=vexa-postgres
       - DB_PORT=5432
       - DB_NAME=${DB_NAME:-vexa}
       - DB_USER=${DB_USER:-postgres}
@@ -145,7 +163,7 @@ services:
       - BOT_SPEAKER_MAX_BUFFER_SEC=${BOT_SPEAKER_MAX_BUFFER_SEC:-}
       - BOT_SPEAKER_IDLE_TIMEOUT_SEC=${BOT_SPEAKER_IDLE_TIMEOUT_SEC:-}
       - VEXA_AGENT_SRC_MOUNT=${VEXA_AGENT_SRC_MOUNT:-}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://vexa-redis:6379/0
       # The Runtime brokers model credentials into spawned agents. Subscription credentials may be
       # mounted from the host; API-style Anthropic/OpenRouter env is forwarded from this trusted service.
       - HOST_CLAUDE_CREDENTIALS=${HOST_CLAUDE_CREDENTIALS:-}
@@ -242,7 +260,7 @@ services:
       - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
       - VEXA_LOG_LEVEL=${LOG_LEVEL:-info}
       # Stream primitive — the per-dispatch redis Streams the control plane relays (unit:<id>:out → SSE).
-      - VEXA_REDIS_URL=redis://redis:6379/0
+      - VEXA_REDIS_URL=redis://vexa-redis:6379/0
       # The backing the Runtime binds into the worker as the workspace store (the project-prefixed volume).
       - VEXA_WORKSPACE_MOUNT_SOURCE=${COMPOSE_PROJECT_NAME:-vexa-v012}_agent-workspaces
       # Three-tier mount stack (AMENDMENT 4): the platform-owned GLOBAL SYSTEM workspace (_global) mounted
@@ -287,12 +305,12 @@ services:
     ports:
       - "127.0.0.1:${MEETING_API_PORT:-18080}:8080"
     environment:
-      - DB_HOST=postgres
+      - DB_HOST=vexa-postgres
       - DB_PORT=5432
       - DB_NAME=${DB_NAME:-vexa}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD:-postgres}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://vexa-redis:6379/0
       - RUNTIME_API_URL=http://runtime:8090
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
       - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-}
@@ -363,7 +381,7 @@ services:
     environment:
       - ADMIN_API_URL=http://admin-api:8001
       - MEETING_API_URL=http://meeting-api:8080
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://vexa-redis:6379/0
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # fastapi-guard edge layer (edge_guard.py): per-IP throttle + auto-ban at the edge.
