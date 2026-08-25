@@ -304,7 +304,7 @@ export async function startCaptureBridge(
   });
   await page.exposeFunction('__vexaNamedAudioData', onNamedAudio).catch(() => { /* optional */ });
   await page.exposeFunction('__vexaSpeakerHint', onSpeakerHint).catch(() => { /* optional */ });
-  // jitsi chat → the embedder's sink (a transcript.v1 `chat` segment at the composition root).
+  // jitsi/gmeet chat → the embedder's sink (a transcript.v1 `chat` segment at the composition root).
   await page.exposeFunction('__vexaChatMessage', (sender: string, text: string): void => {
     try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
   }).catch(() => { /* optional */ });
@@ -419,6 +419,15 @@ export async function startCaptureBridge(
       });
       await w.__vexaGmeetCapture.start();
     }
+    // Meet chat -> the SAME sink the jitsi lane uses, so a typed message becomes an ordinary
+    // transcript.v1 `source:'chat'` segment. Meet keeps chat in the DOM only while the panel is
+    // OPEN (no redux store to read behind it, unlike jitsi), so the module opens it itself.
+    if (w.VexaBrowserUtils?.createGmeetChat && !w.__vexaGmeetChat) {
+      w.__vexaGmeetChat = w.VexaBrowserUtils.createGmeetChat({
+        log: (m: string) => w.logBot?.('[GmeetChat] ' + m),
+        onMessage: (m: { sender: string; text: string }) => w.__vexaChatMessage?.(m.sender, m.text),
+      });
+    }
   }, { isMixed: mixed, isJitsi: jitsi, isTeams: inv.platform === 'teams', isZoom: inv.platform === 'zoom', botName: inv.botName }).catch((e) => {
     console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`); // L4: surfaces only on the VM
   });
@@ -432,6 +441,7 @@ export async function startCaptureBridge(
       try { w.__vexaTeamsSpeakers?.destroy?.(); w.__vexaTeamsSpeakers = null; } catch { /* best-effort */ }
       try { w.__vexaJitsiSpeakers?.destroy?.(); w.__vexaJitsiSpeakers = null; } catch { /* best-effort */ }
       try { w.__vexaJitsiChat?.destroy?.(); w.__vexaJitsiChat = null; } catch { /* best-effort */ }
+      try { w.__vexaGmeetChat?.destroy?.(); w.__vexaGmeetChat = null; } catch { /* best-effort */ }
       try { w.__vexaZoomSpeakers?.destroy?.(); w.__vexaZoomSpeakers = null; } catch { /* best-effort */ }
       try { if (w.__vexaMixRescan) { (globalThis as any).clearInterval(w.__vexaMixRescan); w.__vexaMixRescan = null; } } catch { /* */ }
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }

@@ -67,6 +67,7 @@ import {
   pickBoundName,
   GmeetChannelBinder,
   createPcmCaptureNode,
+  createGmeetChat,
 } from ${JSON.stringify(GMEET)};
 import {
   createMixedAudioCapture,
@@ -95,6 +96,7 @@ const VexaBrowserUtils = {
   pickBoundName,
   GmeetChannelBinder,
   createPcmCaptureNode,
+  createGmeetChat,           // capture-bridge.ts: w.VexaBrowserUtils.createGmeetChat (Meet chat panel → chat segments)
   // ── mixed lane (zoom/teams single combined stream) ──
   createMixedAudioCapture,   // capture-bridge.ts: w.VexaBrowserUtils.createMixedAudioCapture
   installRemoteAudioHook,

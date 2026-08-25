@@ -13,5 +13,7 @@ export { createGmeetSpeakers } from "./gmeet-speakers.js";
 export type { GmeetSpeakers } from "./gmeet-speakers.js";
 export { createGmeetCaptureV1, pickBoundName } from "./gmeet-capture-v1.js";
 export type { GmeetCaptureV1, GmeetCaptureV1Options } from "./gmeet-capture-v1.js";
+export { createGmeetChat } from "./gmeet-chat.js";
+export type { GmeetChat, GmeetChatMessage, GmeetChatOptions } from "./gmeet-chat.js";
 export { GmeetChannelBinder } from "./gmeet-channel-binder.js";
 export type { GmeetChannelBinderOptions } from "./gmeet-channel-binder.js";
