@@ -308,6 +308,9 @@ def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
                 # pathwarden patch: thread the (already-accepted, previously-ignored)
                 # automatic_leave through so a client can widen the lobby wait.
                 automatic_leave=body.get("automatic_leave"),
+                # pathwarden patch: per-request authenticated opt-in. Absent ⇒ the
+                # BOT_AUTHENTICATED deployment default (resolve_authenticated).
+                authenticated=body.get("authenticated"),
                 max_concurrent=max_concurrent,
                 webhook_url=x_user_webhook_url,
                 webhook_secret=x_user_webhook_secret,

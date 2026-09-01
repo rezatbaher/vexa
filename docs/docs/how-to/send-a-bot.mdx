@@ -121,10 +121,12 @@ The audio **recording** lands in your object storage — retrieve it via `GET /r
 
 ## Authenticated mode
 
-When `authenticated: true` is set in the request, the bot uses a persistent browser profile to join
-the call as your Google account. If the profile is signed out (session expired, cookies cleared), the
-bot **refuses to join** with an `auth_session_missing` error — it never silently degrades to an anonymous
-join. Re-authenticate the browser profile and retry.
+Set `authenticated: true` on the `POST /bots` request and the bot restores the provisioned browser
+profile and joins as that Google account instead of an anonymous guest. Omit the field and the
+deployment's `BOT_AUTHENTICATED` default applies, so one deployment serves both signed-in and guest
+bots. If the profile is signed out (session expired, cookies cleared), the bot **refuses to join**
+with an `auth_session_missing` error — it never silently degrades to an anonymous join. Re-provision
+with `make login` and retry; see [Authenticated bots](/authenticated-bots).
 
 ## Next
 

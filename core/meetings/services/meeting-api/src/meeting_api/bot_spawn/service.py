@@ -133,6 +133,28 @@ def resolve_automatic_leave(requested: Optional[dict]) -> dict:
     return out
 
 
+# pathwarden patch — per-request authenticated opt-in.
+#
+# Upstream reads BOT_AUTHENTICATED off the env and applies it to EVERY spawn, so a deployment that
+# provisions a signed-in session loses the anonymous path entirely. A caller that wants both —
+# prefer the signed-in identity, fall back to a guest bot when the stored session is busy (409) or
+# unconfigured (503) — therefore carries the choice on the request, and the env knob stays the
+# DEFAULT for a caller that says nothing. A deployment that never sends the field is unchanged.
+#
+# Deliberately a BOOLEAN only: the userdata prefix stays the deployment's BOT_USERDATA_S3_PATH.
+# A caller-supplied prefix would let any request point the bot at — and write its rotated session
+# back to — an arbitrary path in the bucket. A multi-identity version selects by a NAMED key
+# resolved against the env, never a raw path.
+def resolve_authenticated(requested: Optional[bool], env_default: bool) -> bool:
+    """The effective authenticated-mode flag: an explicit request boolean wins, else the env knob.
+
+    Anything that is not a real bool (a string, a number, ``None``) is not a choice — it falls
+    through to ``env_default`` rather than being coerced, so a malformed field can never flip a
+    deployment's mode in either direction.
+    """
+    return requested if isinstance(requested, bool) else env_default
+
+
 def construct_meeting_url(platform: str, native_meeting_id: str) -> Optional[str]:
     """Best-effort meeting URL for ``(platform, native_id)`` (zoom needs more than the id →
     None; the caller may pass an explicit ``meeting_url`` instead)."""
@@ -201,6 +223,9 @@ async def request_bot(
     # this field (the body is an open dict) but nothing read it, so the lobby window was pinned at
     # the hardcoded 10 minutes and any client tuning it was silently ignored.
     automatic_leave: Optional[dict] = None,
+    # pathwarden patch: per-request authenticated opt-in — see resolve_authenticated. ``None`` ⇒
+    # the BOT_AUTHENTICATED env default, so a caller that never sends the field is unchanged.
+    authenticated: Optional[bool] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -268,16 +293,18 @@ async def request_bot(
                 f"{int(_STT_VERDICT_MAX_AGE_S)}s, or call /health?force=1 to re-probe now"
             )
 
-    # 1c. Authenticated-bot mode (#724, deployment-scoped knob — Q1-A): when BOT_AUTHENTICATED is
-    #     set, EVERY spawn carries the sealed invocation.v1 auth block, so the bot restores the
-    #     deployment's provisioned browser session (`make login`) and joins signed-in. Config is
-    #     gated loud BEFORE any DB write (the TranscriptionNotConfigured precedent) — a half-
-    #     configured knob must never spawn a bot that silently joins anonymous. Env vocabulary
-    #     matches the provisioning CLI: BOT_USERDATA_S3_PATH + BOT_S3_{ENDPOINT,BUCKET,ACCESS_KEY,
-    #     SECRET_KEY} (scoped userdata credentials — never the deployment's admin S3 creds; they
-    #     ride the invocation env into the bot container, so their blast radius must stay the
-    #     userdata prefix).
-    authenticated = env_flag("BOT_AUTHENTICATED", False)
+    # 1c. Authenticated-bot mode (#724): when authenticated mode is in effect the spawn carries the
+    #     sealed invocation.v1 auth block, so the bot restores the deployment's provisioned browser
+    #     session (`make login`) and joins signed-in. The mode is chosen PER REQUEST (pathwarden
+    #     patch — see resolve_authenticated), with BOT_AUTHENTICATED as the default for a caller
+    #     that does not say; that is what lets one deployment serve both signed-in and guest bots.
+    #     Config is gated loud BEFORE any DB write (the TranscriptionNotConfigured precedent) — a
+    #     request that ASKS for authenticated against a half-configured store must never spawn a bot
+    #     that silently joins anonymous. Env vocabulary matches the provisioning CLI:
+    #     BOT_USERDATA_S3_PATH + BOT_S3_{ENDPOINT,BUCKET,ACCESS_KEY,SECRET_KEY} (scoped userdata
+    #     credentials — never the deployment's admin S3 creds; they ride the invocation env into the
+    #     bot container, so their blast radius must stay the userdata prefix).
+    authenticated = resolve_authenticated(authenticated, env_flag("BOT_AUTHENTICATED", False))
     auth_userdata_path: Optional[str] = None
     auth_s3: dict[str, Optional[str]] = {}
     if authenticated:
@@ -290,7 +317,7 @@ async def request_bot(
         }
         if not (auth_userdata_path and auth_s3["s3_endpoint"] and auth_s3["s3_bucket"]):
             raise AuthSessionNotConfigured(
-                "BOT_AUTHENTICATED is set but the userdata store is incomplete — set "
+                "authenticated mode was requested but the userdata store is incomplete — set "
                 "BOT_USERDATA_S3_PATH + BOT_S3_ENDPOINT + BOT_S3_BUCKET (and scoped "
                 "BOT_S3_ACCESS_KEY/BOT_S3_SECRET_KEY); provision the session with `make login`"
             )

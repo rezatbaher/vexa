@@ -42,8 +42,11 @@ personal one.
 
 ## 2. Configure the deployment to spawn signed-in
 
-Authenticated mode is a **deployment property**: set it once on `meeting-api` and every stock
-`POST /bots` spawns signed-in — no per-request field, no hand-crafted bot config.
+Authenticated mode is a **deployment default with a per-request override**. Point `meeting-api` at
+the provisioned session and set the default below; every stock `POST /bots` then spawns signed-in
+with no hand-crafted bot config. A request carrying `authenticated: true` or `authenticated: false`
+overrides the default for that spawn — which is what lets one deployment serve both signed-in and
+guest bots (prefer the account, fall back to a guest when the session is busy or unconfigured).
 
 ```bash
 # meeting-api environment (compose: deploy/compose .env; helm: meeting-api env values)
@@ -55,11 +58,11 @@ BOT_S3_ACCESS_KEY=...
 BOT_S3_SECRET_KEY=...
 ```
 
-With the knob set, each bot restores the stored session into its own ephemeral browser profile
-before launch and joins as the signed-in account — no guest-name entry, no lobby knock where the
-account has access. If the knob is set but the storage config is incomplete, `POST /bots` refuses
-with a 503 naming what's missing — a half-configured deployment never silently spawns anonymous
-bots. If the session store is unreachable at spawn time, the bot fails loud with a typed
+With authenticated mode in effect for a spawn, the bot restores the stored session into its own
+ephemeral browser profile before launch and joins as the signed-in account — no guest-name entry, no
+lobby knock where the account has access. If a spawn asks for authenticated mode but the storage
+config is incomplete, `POST /bots` refuses with a 503 naming what's missing — a half-configured
+deployment never silently spawns anonymous bots. If the session store is unreachable at spawn time, the bot fails loud with a typed
 `session-restore` error naming the step and endpoint — it never joins signed-out on a failed
 restore.
 
