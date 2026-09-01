@@ -225,6 +225,10 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
     }
     const stopRemoval = deps.join.onRemoval(() => signalEnd?.('evicted'));
+    // The room emptying out is a NORMAL end-of-meeting, distinct from being removed (`evicted`) and
+    // from the 4h backstop below. Optional on the port: a driver without a verified presence signal
+    // returns nothing and this is a no-op, exactly as before.
+    const stopAlone = deps.join.onAlone?.(() => signalEnd?.('left_alone')) ?? (() => { /* not wired */ });
     const unsubscribe = deps.acts.subscribe(handle);
     const cap = opts.maxActiveMs && opts.maxActiveMs > 0
       ? setTimeout(() => signalEnd?.('max_bot_time_exceeded'), opts.maxActiveMs)
@@ -236,6 +240,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     if (cap) clearTimeout(cap);
     unsubscribe();
     stopRemoval();
+    stopAlone();
     await deps.pipeline.stop().catch(() => { /* best-effort */ });
     deps.recording?.close(recordingKey);
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall

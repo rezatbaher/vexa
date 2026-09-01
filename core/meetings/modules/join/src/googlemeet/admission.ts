@@ -82,15 +82,28 @@ export async function checkForGoogleRejection(page: Page): Promise<boolean> {
  * Presence of >=1 such tile is a POSITIVE admitted signal independent of that guard.
  */
 const EFFECTS_TILE = /visual_effects|backgrounds and effects/i;
-export async function countRealParticipantTiles(page: Page): Promise<number> {
+
+/** The ONE tile reader. Returns `null` when the DOM could not be read at all.
+ *
+ * ⚠️ The distinction is load-bearing for any PRESENCE decision: a failed read and a genuinely
+ * empty room both look like "0 tiles", and `countRealParticipantTiles` deliberately collapses
+ * them (an admission check only ever asks "is there positive evidence I am IN?", where 0 and
+ * unknown are the same answer). A monitor that LEAVES a meeting on a low count must not inherit
+ * that conflation — a Playwright error would read as "everybody left" and drop the bot out of a
+ * live call. Callers that act on absence take this variant and treat `null` as "no evidence". */
+export async function countRealParticipantTilesStrict(page: Page): Promise<number | null> {
   try {
     const labels = await page.locator("[data-participant-id]").evaluateAll(
       els => els.map(e => e.getAttribute("aria-label") || (e.textContent || "").trim()),
     );
     return labels.filter(l => l && !EFFECTS_TILE.test(l)).length;
   } catch {
-    return 0;
+    return null;
   }
+}
+
+export async function countRealParticipantTiles(page: Page): Promise<number> {
+  return (await countRealParticipantTilesStrict(page)) ?? 0;
 }
 
 export async function dumpAdmissionState(page: Page, tag: string): Promise<void> {

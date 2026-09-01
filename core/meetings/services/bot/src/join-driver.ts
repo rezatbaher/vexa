@@ -11,6 +11,7 @@ import {
   AdmissionError,
   leaveGoogleMeet, leaveMicrosoftTeams, leaveZoomMeeting, leaveJitsiMeeting,
   startGoogleRemovalMonitor, startTeamsRemovalMonitor, startZoomRemovalMonitor, startJitsiRemovalMonitor,
+  startGoogleAlonenessMonitor,
   type JoinState, type Platform as JoinPlatform, type AdmissionOutcome,
 } from '@vexa/join';
 import type { BotStatus } from './contracts.js';
@@ -87,6 +88,15 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
       if (platform === 'zoom')  return startZoomRemovalMonitor(page, cb);
       if (platform === 'jitsi') return startJitsiRemovalMonitor(page, cb);
       return startGoogleRemovalMonitor(page, cb);
+    },
+    onAlone(cb) {
+      // Meet ONLY. Jitsi ends reliably on its own (`isJoined()` flips) and Zoom watches navigation,
+      // so neither needs this; Teams shares Meet's gap but its presence DOM is unverified here and a
+      // guessed selector on a LEAVE decision is worse than the existing 4h backstop.
+      if (platform !== 'google_meet') return () => { /* no verified presence signal */ };
+      return startGoogleAlonenessMonitor(page as any, cb, {
+        timeoutMs: inv.automaticLeave?.everyoneLeftTimeout,
+      });
     },
     async leave(reason) {
       if (platform === 'teams') { await leaveMicrosoftTeams(page, undefined, reason); return; }

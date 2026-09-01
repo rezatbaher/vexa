@@ -27,6 +27,11 @@ export interface JoinDriver {
   join(report: (s: BotStatus) => void | Promise<void>): Promise<JoinOutcome>;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
+  /** Watch for the meeting EMPTYING OUT (every other participant left) while active; returns a
+   *  stop fn. OPTIONAL on purpose: only a platform with a presence signal we have actually verified
+   *  implements it, and a driver that omits it simply keeps the previous behaviour (the 4h
+   *  `maxActiveMs` backstop). Fires at most once. */
+  onAlone?(cb: () => void): () => void;
   /** Leave the meeting (best-effort; never throws fatally). */
   leave(reason: string): Promise<void>;
   /** Withdraw a PENDING join request from the waiting room / pre-join screen (Bug 2): cancel the
