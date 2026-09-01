@@ -92,6 +92,46 @@ def _start_ticker(scheduler) -> None:
     threading.Thread(target=_loop, name="scheduler-tick", daemon=True).start()
 
 
+def _start_container_janitor(backend) -> None:
+    """Reclaim EXITED workload containers on an interval (``RUNTIME_REAP_EXITED_AFTER_SEC``,
+    default 24h; ``0`` disables). No-op on a backend that does not implement the sweep.
+
+    Closes the accumulation half of the 2026-09-01 orphan report: nothing in this runtime ever
+    removed a finished container. ``auto_remove`` is set nowhere, the kernel only observes an exit,
+    and the one ``docker rm`` path (``DELETE /workloads/{id}``) is driven by meeting-api sweeps that
+    query only NON-TERMINAL meetings — so a bot that completes normally leaves a husk behind by
+    construction. Production had accumulated 17 over six weeks.
+
+    Feature-detected rather than added to the Backend port: k8s garbage-collects finished Pods on
+    its own and the process backend has no containers, so only the docker backend implements it and
+    the other two are deliberately untouched.
+    """
+    older_than = float(os.getenv("RUNTIME_REAP_EXITED_AFTER_SEC", "86400"))
+    if not (older_than > 0):
+        logger.info("container janitor disabled (RUNTIME_REAP_EXITED_AFTER_SEC=%s)", older_than)
+        return
+    reap = getattr(backend, "reap_exited_workloads", None)
+    if reap is None:
+        return
+    interval = float(os.getenv("RUNTIME_REAP_INTERVAL_SEC", "3600"))
+
+    def _loop() -> None:
+        while True:
+            try:
+                n = reap(older_than_sec=older_than)
+                if n:
+                    logger.info("container janitor reclaimed %d exited workload container(s)", n)
+            except Exception as e:  # noqa: BLE001 — housekeeping must never kill the loop
+                logger.warning("container janitor error: %s", e)
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, name="container-janitor", daemon=True).start()
+    logger.info(
+        "container janitor started (reap exited after %.0fh, every %.0fm)",
+        older_than / 3600.0, interval / 60.0,
+    )
+
+
 def _build_backend():
     """Select the spawn backend from ``RUNTIME_BACKEND`` (default ``docker``). compose/desktop run
     ``docker`` (host socket API); a k8s deployment runs ``k8s`` (spawns Pods via kubectl under the
@@ -162,6 +202,7 @@ def build_production_app():
     scheduler = _build_scheduler()
     if scheduler is not None:
         _start_ticker(scheduler)
+    _start_container_janitor(backend)
     # apply_command_overrides is a no-op unless BOT_COMMAND / AGENT_WORKER_COMMAND are set (the
     # process-backend / `lite` case) — docker/k8s keep the image entrypoints unchanged.
     profiles = apply_command_overrides(default_registry())

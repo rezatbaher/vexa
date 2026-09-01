@@ -333,6 +333,107 @@ class DockerBackend:
             logger.warning("workload container discovery failed: %s", e)
         return list(found.values())
 
+    def reap_exited_workloads(self, *, older_than_sec: float) -> int:
+        """Remove EXITED managed workload containers that finished more than ``older_than_sec`` ago.
+        Returns how many were removed. Never raises.
+
+        WHY THIS EXISTS: nothing in the runtime ever removed a finished container. ``auto_remove`` is
+        set nowhere, the kernel only OBSERVES an exit (``Runtime.get`` rewrites the status record and
+        makes no backend call), and the single ``docker rm`` path — ``Runtime.destroy`` via
+        ``DELETE /workloads/{id}`` — is driven by meeting-api sweeps that query only NON-TERMINAL
+        meetings. A bot that completes normally makes its meeting terminal BEFORE any teardown is
+        issued, so its container is never removed by anyone: 17 husks accumulated over six weeks on
+        production (and 5 on dev) before a human deleted them by hand.
+
+        ── Retention, not immediate removal (deliberate) ──────────────────────────────────────────
+        ``docker logs`` on a finished bot is the primary post-mortem tool for this system — the
+        2026-09-01 empty-room incident was diagnosed entirely from a dead bot's log, and setting
+        ``auto_remove`` (or removing on exit) would have destroyed exactly that evidence. So this
+        keeps recent corpses and only reclaims old ones. A day of history costs a few GB; the
+        alternative costs the ability to explain a failure.
+
+        ── Safety ────────────────────────────────────────────────────────────────────────────────
+        * RUNNING containers are never touched — not even old ones. "Old and running" is a live
+          long meeting, and killing one is the failure mode this whole subsystem is most afraid of
+          (`reconcile.py` refuses to reap a workload the runtime reports alive, for that reason).
+          A wedged bot is bounded by its own ``maxActiveMs``; it is not this sweep's business.
+        * STACK-SCOPED by the same network discriminator as discovery: on a shared daemon the
+          managed label is identical across stacks, so a label-only filter would reap another
+          stack's containers.
+        * ``force=false``: a container that started running between the listing and the delete is
+          refused by the daemon rather than killed.
+        * A container whose finish time cannot be read is SKIPPED, never reaped on an assumption.
+        """
+        if not (older_than_sec > 0):
+            return 0
+        removed = 0
+        network = _stack_network()
+        try:
+            import json as _json
+            from datetime import datetime, timezone
+
+            spec: dict = {"label": [f"{MANAGED_LABEL}=true"], "status": ["exited"]}
+            if network:
+                spec["network"] = [network]
+            r = self._req("GET", f"/containers/json?all=1&filters={quote(_json.dumps(spec), safe='')}")
+            if r.status_code != 200:
+                logger.warning("reap: container listing failed (%s)", r.status_code)
+                return 0
+            now = datetime.now(timezone.utc)
+            for c in r.json():
+                cid = c.get("Id")
+                if not cid:
+                    continue
+                finished = self._finished_at(cid)
+                if finished is None:
+                    continue  # unreadable finish time → never reap on an assumption
+                age = (now - finished).total_seconds()
+                if age < older_than_sec:
+                    continue
+                d = self._req("DELETE", f"/containers/{cid}?force=false")
+                if d.status_code in (204, 404):
+                    removed += 1
+                    logger.info(
+                        "reaped exited workload container %s (finished %.0fh ago)",
+                        (c.get("Names") or [cid])[0].lstrip("/"), age / 3600.0,
+                    )
+                else:
+                    logger.warning(
+                        "reap: delete %s failed (%s): %s",
+                        cid[:12], d.status_code, d.text.strip()[:200],
+                    )
+        except Exception as e:  # noqa: BLE001 — housekeeping must never disturb the runtime
+            logger.warning("reap of exited workload containers failed: %s", e)
+        return removed
+
+    def _finished_at(self, cid: str):
+        """``State.FinishedAt`` as an aware datetime, or None (unreadable / still running / docker's
+        zero value ``0001-01-01T00:00:00Z``, which means "never finished")."""
+        try:
+            r = self._req("GET", f"/containers/{cid}/json")
+            if r.status_code != 200:
+                return None
+            state = r.json().get("State") or {}
+            if state.get("Running"):
+                return None
+            raw = state.get("FinishedAt")
+            if not raw or raw.startswith("0001-01-01"):
+                return None
+            from datetime import datetime, timezone
+
+            # Docker emits RFC3339 with nanosecond precision; fromisoformat takes at most 6 digits.
+            txt = raw.replace("Z", "+00:00")
+            if "." in txt:
+                head, _, tail = txt.partition(".")
+                frac, sign, off = tail.partition("+")
+                if not sign:
+                    frac, sign, off = tail.partition("-")
+                txt = f"{head}.{frac[:6]}{sign}{off}"
+            dt = datetime.fromisoformat(txt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:  # noqa: BLE001 — an unreadable timestamp is a skip, not a failure
+            return None
+
     def _adoptable(self, workload_id: str, c: dict) -> dict:
         """Shape one /containers/json entry as an adoption record for the kernel."""
         name = self._cname(workload_id)
