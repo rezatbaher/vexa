@@ -474,6 +474,16 @@ export async function startCaptureBridge(
                 .filter(node => !node.closest('[data-participant-id],[data-message-id],[data-sender-id],[role="log"]'))
                 .map(node => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim())
                 .map(text => /^(in the meeting|in this call|in the call)\b/i.test(text) ? 'in-call' : /^contributors\b/i.test(text) ? 'contributors' : /^viewers\b/i.test(text) ? 'viewers' : /^waiting\b/i.test(text) ? 'waiting' : 'other').slice(0, 16) : [],
+              panelStructure: panel ? (Array.from(panel.querySelectorAll('*')) as any[]).slice(0, 180).map(node => {
+                const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+                const aria = String(node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const kind = (value: string) => /^(in the meeting|in this call|in the call)\b/i.test(value) ? 'in-call'
+                  : /^contributors\b/i.test(value) ? 'contributors' : /^viewers\b/i.test(value) ? 'viewers'
+                  : /^waiting\b/i.test(value) ? 'waiting' : /^\d{1,4}$/.test(value) ? 'numeric' : 'other';
+                return { tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name),
+                  visible: !!node.getClientRects().length, children: node.children.length,
+                  textKind: kind(text), ariaKind: kind(aria), participantAncestor: !!node.closest('[data-participant-id]') };
+              }) : [],
               // Only generic UI-control metadata and booleans; never names, IDs or
               // full DOM/text. This probe diagnoses provider markup drift safely.
               controls: (Array.from(w.document.querySelectorAll('[aria-label],[data-tooltip]')) as any[])
@@ -499,11 +509,14 @@ export async function startCaptureBridge(
                 }))).slice(0, 24),
               tileStructure: Array.from(w.document.querySelectorAll('[data-participant-id]')).slice(0, 8).map((node: any) => ({
                 tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name),
+                visible: !!node.getClientRects().length,
+                effectsPreview: /visual_effects|backgrounds and effects/i.test(String(node.getAttribute('aria-label') || node.textContent || '')),
                 flags: Object.fromEntries(Array.from(node.attributes).filter((a: any) => /^(true|false)$/i.test(a.value)).map((a: any) => [a.name, a.value])),
                 descendants: [...new Set((Array.from(node.querySelectorAll('*')) as any[]).flatMap(child => Array.from(child.attributes).map((a: any) => a.name)))],
                 media: (Array.from(node.querySelectorAll('audio,video')) as any[]).map(media => ({
                   tag: media.tagName, tracks: media.srcObject?.getTracks?.().map((track: any) => ({
-                    kind: track.kind, settingsKeys: Object.keys(track.getSettings?.() || {}),
+                    kind: track.kind, provenLocal: w.__vexaIsLocalMediaTrack?.(track) === true,
+                    settingsKeys: Object.keys(track.getSettings?.() || {}),
                   })) || [],
                 })),
               })) }));

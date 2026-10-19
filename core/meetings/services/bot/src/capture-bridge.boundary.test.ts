@@ -202,6 +202,12 @@ async function main(): Promise<void> {
       check('already-open People panel is never toggled closed', await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===1'));
       await page.evaluate('document.getElementById("people-panel").hidden=true;document.querySelector("button").setAttribute("aria-expanded","false")');
       check('hidden panel cannot keep history available', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      await page.evaluate(`document.getElementById('people-panel').hidden=false;document.querySelector('button').setAttribute('aria-expanded','true');
+        document.getElementById('total').outerHTML='<div>In the meeting (1234)</div><div>Private Participant 1234</div>';
+        window.__vexaRoomProbeLogged=false;window.__vexaRoomSnapshot();`);
+      const panelProbe = pageLogs.filter(line => line.startsWith('[RoomPresence]')).at(-1) || '';
+      check('panel drift probe reports category without private text or raw numbers', panelProbe.includes('"textKind":"in-call"') && !/1234|Private Participant|VOXAI|"human"|"self"/.test(panelProbe));
+
       await page.evaluate('document.querySelector("button").removeAttribute("data-panel-id")');
       check('invite/unlinked people action is never clicked', !await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===1'));
 
