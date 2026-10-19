@@ -25,7 +25,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchPersistentBrowser, type BrowserContext } from '@vexa/remote-browser';
 import { startCaptureBridge } from './capture-bridge.js';
-import { ensureMeetingMicUnmuted, installLocalMediaTracker } from './meeting-dom.js';
+import { ensureMeetingMicUnmuted, installLocalMediaTracker, ensureMeetingPeoplePanel } from './meeting-dom.js';
 import type { BotPipeline, HintCounters } from './pipeline.js';
 import type { Invocation } from './config.js';
 
@@ -149,14 +149,22 @@ async function main(): Promise<void> {
       const remote = await received;
       const localClone = local.getVideoTracks()[0].clone();
       const remoteClone = remote.clone();
-      w.__fixtureLocal = new w.MediaStream([localClone]); w.__fixtureRemote = new w.MediaStream([remoteClone]);
+      const localStreamClone = local.clone().clone();
+      const remoteStreamClone = new w.MediaStream([remote]).clone();
+      const mixedClone = new w.MediaStream([localClone, remoteClone]).clone();
+      w.__fixtureLocal = localStreamClone; w.__fixtureRemote = new w.MediaStream([remoteClone]);
+      w.__fixtureMixed = new w.MediaStream([localClone, remoteClone]);
       w.__fixtureCapture = local;
       w.__fixturePeers = [sender, receiver];
       return { local: w.__vexaIsLocalMediaTrack(local.getVideoTracks()[0]),
         localClone: w.__vexaIsLocalMediaTrack(localClone), remote: w.__vexaIsLocalMediaTrack(remote),
-        remoteClone: w.__vexaIsLocalMediaTrack(remoteClone) };
+        remoteClone: w.__vexaIsLocalMediaTrack(remoteClone),
+        localStreamClone: localStreamClone.getTracks().every((track: any) => w.__vexaIsLocalMediaTrack(track)),
+        localConstructor: new w.MediaStream(local).getTracks().every((track: any) => w.__vexaIsLocalMediaTrack(track)),
+        remoteStreamClone: remoteStreamClone.getTracks().some((track: any) => w.__vexaIsLocalMediaTrack(track)),
+        mixedClone: mixedClone.getTracks().some((track: any) => w.__vexaIsLocalMediaTrack(track)) };
     });
-    check('native capture and clone provenance excludes no remote tracks', nativeIdentity.local && nativeIdentity.localClone && !nativeIdentity.remote && !nativeIdentity.remoteClone, JSON.stringify(nativeIdentity));
+    check('native capture and clone provenance excludes no remote tracks', nativeIdentity.local && nativeIdentity.localClone && nativeIdentity.localStreamClone && nativeIdentity.localConstructor && !nativeIdentity.remote && !nativeIdentity.remoteClone && !nativeIdentity.remoteStreamClone && !nativeIdentity.mixedClone, JSON.stringify(nativeIdentity));
     // Both labels match the bot. Only the native captured track can identify self.
     await page.setContent(`<div data-participant-id="self"><span class="notranslate">VOXAI</span><video id="local-video" muted autoplay></video></div>
       <div data-participant-id="human"><span class="notranslate">VOXAI</span><video id="remote-video" muted autoplay></video></div>
@@ -164,7 +172,7 @@ async function main(): Promise<void> {
     await page.evaluate('document.getElementById("local-video").srcObject=window.__fixtureLocal;document.getElementById("remote-video").srcObject=window.__fixtureRemote');
     await page.addScriptTag({ path: BUNDLE });
     await page.evaluate('globalThis.__name = (t, v) => t;');
-    const googleStop = await startCaptureBridge(page, { ...inv, platform: 'google_meet' }, pipeline);
+    const googleStop = await startCaptureBridge(page, { ...inv, platform: 'google_meet', voiceAgentEnabled: true }, pipeline);
     try {
       check('sibling count badge proves complete Google roster', await page.evaluate('window.__vexaRoomSnapshot().complete'));
       check('structural self excluded; human kept', await page.evaluate('JSON.stringify(window.__vexaRoomSnapshot().ids)===JSON.stringify(["human"])'));
@@ -178,10 +186,25 @@ async function main(): Promise<void> {
       check('no count cannot infer completeness from visible tiles', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
       await page.evaluate('document.querySelector("button").setAttribute("aria-label","Show everyone 2");document.querySelector("button").parentElement.insertAdjacentHTML("beforeend","<span>3</span>")');
       check('ambiguous count keeps roster incomplete', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
-      await page.evaluate('document.getElementById("remote-video").srcObject=window.__fixtureLocal');
+      await page.evaluate('document.getElementById("local-video").srcObject=null;document.getElementById("remote-video").srcObject=window.__fixtureMixed');
+      check('mixed local/remote media never excludes a human', await page.evaluate('window.__vexaRoomSnapshot().ids.length===2'));
+      await page.evaluate('document.getElementById("local-video").srcObject=window.__fixtureLocal;document.getElementById("remote-video").srcObject=window.__fixtureLocal');
       check('ambiguous local media never excludes a human tile', await page.evaluate('window.__vexaRoomSnapshot().ids.length===2'));
       await page.evaluate('document.getElementById("local-video").srcObject=null;document.getElementById("remote-video").srcObject=null');
       check('matching display names never identify self', await page.evaluate('window.__vexaRoomSnapshot().ids.length===2'));
+      // Provider hides its total in a linked People panel rather than a badge.
+      await page.evaluate(`document.querySelector('button').removeAttribute('aria-label');document.querySelector('button').parentElement.querySelectorAll('span:not(.google-symbols)').forEach(n=>n.remove());
+        const b=document.querySelector('button');b.setAttribute('aria-label','Open the people panel');b.setAttribute('aria-controls','people-panel');b.setAttribute('data-panel-id','people');b.setAttribute('aria-expanded','false');
+        b.onclick=()=>{b.setAttribute('aria-expanded','true');document.getElementById('people-panel').hidden=false;window.peopleClicks=(window.peopleClicks||0)+1;};
+        document.body.insertAdjacentHTML('beforeend','<section id="people-panel" hidden><h2 id="total">In the meeting (2)</h2><h2>Waiting to be admitted (9)</h2><div data-participant-id="human"><h2>In the meeting (1234)</h2></div></section>');`);
+      check('opens only the linked People panel', await ensureMeetingPeoplePanel(page));
+      check('linked in-call header proves count; waiting/name numbers do not', await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      check('already-open People panel is never toggled closed', await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===1'));
+      await page.evaluate('document.getElementById("people-panel").hidden=true;document.querySelector("button").setAttribute("aria-expanded","false")');
+      check('hidden panel cannot keep history available', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      await page.evaluate('document.querySelector("button").removeAttribute("data-panel-id")');
+      check('invite/unlinked people action is never clicked', !await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===1'));
+
     } finally {
       await googleStop();
       await page.evaluate('window.__fixturePeers.forEach(peer=>peer.close());window.__fixtureLocal.getTracks().forEach(track=>track.stop());window.__fixtureCapture.getTracks().forEach(track=>track.stop())');

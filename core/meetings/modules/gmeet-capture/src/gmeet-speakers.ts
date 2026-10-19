@@ -140,7 +140,8 @@ export function createGmeetSpeakers(opts: GmeetSpeakersOptions = {}): GmeetSpeak
     for (const media of Array.from(document.querySelectorAll('video,audio'))) {
       const stream = (media as HTMLMediaElement).srcObject;
       if (!(stream instanceof MediaStream)) continue;
-      if (!stream.getTracks().some(track => { try { return opts.isLocalTrack?.(track) === true; } catch { return false; } })) continue;
+      const tracks = stream.getTracks();
+      if (!tracks.length || !tracks.every(track => { try { return opts.isLocalTrack?.(track) === true; } catch { return false; } })) continue;
       const id = media.closest('[data-participant-id]')?.getAttribute('data-participant-id');
       if (id) localIds.add(id);
     }

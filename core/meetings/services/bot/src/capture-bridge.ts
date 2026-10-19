@@ -1,4 +1,4 @@
-import { ensureMeetingMicUnmuted, installLocalMediaTracker } from './meeting-dom.js';
+import { ensureMeetingMicUnmuted, installLocalMediaTracker, ensureMeetingPeoplePanel } from './meeting-dom.js';
 /**
  * Capture bridge (2b) — the browser-resident capture → pipeline pump + the speak path.
  *
@@ -163,7 +163,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   const args = [...getAuthenticatedBrowserArgs(), ...getJoinBrowserArgs()];
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
 
-  await installLocalMediaTracker(context);
+  if (inv.platform === 'google_meet' && inv.voiceAgentEnabled) await installLocalMediaTracker(context);
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
   await context.addInitScript(`window.__vexa_voice_agent_enabled = ${!!inv.voiceAgentEnabled};`);
@@ -318,6 +318,8 @@ export async function startCaptureBridge(
     try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
   }).catch(() => { /* optional */ });
 
+  if (inv.platform === 'google_meet' && inv.voiceAgentEnabled) await ensureMeetingPeoplePanel(page);
+
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
@@ -448,12 +450,30 @@ export async function startCaptureBridge(
               }
             }
           }
+          const linked = w.__vexaPeoplePanel;
+          const panel = linked && w.document.getElementById(linked.target);
+          const activeControl = linked && buttons.filter(button => button.getAttribute('aria-controls') === linked.target
+            && button.getAttribute('data-panel-id') === linked.panel && button.getAttribute('aria-expanded') === 'true');
+          if (panel?.getClientRects().length && activeControl?.length === 1) {
+            for (const header of Array.from(panel.querySelectorAll('h1,h2,[role="heading"],[aria-expanded]')) as any[]) {
+              if (!header.getClientRects().length || header.closest('[data-participant-id],[data-message-id],[data-sender-id],[role="log"]')) continue;
+              const text = String(header.getAttribute('aria-label') || header.textContent || '').replace(/\s+/g, ' ').trim();
+              const match = /^(?:in the meeting|in this call|in the call)\s*\(?\s*(\d{1,4})\s*\)?$/i.exec(text);
+              if (match) counts.add(Number(match[1]));
+            }
+          }
           const complete = counts.size === 1 && counts.has(new Set(state.tiles.map((t: any) => t.id)).size);
           if (!complete && Date.now() >= roomProbeAfter && !(w as any).__vexaRoomProbeLogged) {
             (w as any).__vexaRoomProbeLogged = true;
             // Operational structure only: no participant names, IDs, text or credentials.
             w.logBot?.('[RoomPresence] ' + JSON.stringify({ countCandidates: counts.size, expectedCountObserved: counts.has(new Set(state.tiles.map((t: any) => t.id)).size), tiles: state.tiles.length,
               selfMarkers: w.document.querySelectorAll('[data-self-name]').length, localTrackerReady: typeof w.__vexaIsLocalMediaTrack === 'function',
+              selfTiles: state.tiles.filter((t: any) => t.self).length, localMediaStats: w.__vexaLocalMediaStats?.(),
+              peoplePanelLinked: !!linked, peoplePanelActive: !!panel?.getClientRects().length && activeControl?.length === 1,
+              panelHeaderKinds: panel ? (Array.from(panel.querySelectorAll('h1,h2,[role="heading"],[aria-expanded]')) as any[])
+                .filter(node => !node.closest('[data-participant-id],[data-message-id],[data-sender-id],[role="log"]'))
+                .map(node => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim())
+                .map(text => /^(in the meeting|in this call|in the call)\b/i.test(text) ? 'in-call' : /^contributors\b/i.test(text) ? 'contributors' : /^viewers\b/i.test(text) ? 'viewers' : /^waiting\b/i.test(text) ? 'waiting' : 'other').slice(0, 16) : [],
               // Only generic UI-control metadata and booleans; never names, IDs or
               // full DOM/text. This probe diagnoses provider markup drift safely.
               controls: (Array.from(w.document.querySelectorAll('[aria-label],[data-tooltip]')) as any[])
@@ -514,6 +534,9 @@ export async function startCaptureBridge(
     // OPEN (no redux store to read behind it, unlike jitsi), so the module opens it itself.
     if (w.VexaBrowserUtils?.createGmeetChat && !w.__vexaGmeetChat) {
       w.__vexaGmeetChat = w.VexaBrowserUtils.createGmeetChat({
+        // Keep an observed People panel stable; chat can still be opened for explicit
+        // delivery. Losing the in-call count invalidates room history immediately.
+        autoOpenPanel: !w.__vexaPeoplePanel,
         log: (m: string) => w.logBot?.('[GmeetChat] ' + m),
         onMessage: (m: { sender: string; text: string }) => w.__vexaChatMessage?.(m.sender, m.text),
       });
