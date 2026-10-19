@@ -309,6 +309,27 @@
    "default": "<tempdir>/vexa-workloads",
    "description": "process-backend workload log dir — per-workload stdout/stderr capture (the process analog of docker logs); fail-open to DEVNULL if unwritable",
    "targets": []
+  },
+  {
+   "key": "RUNTIME_REAP_EXITED_AFTER_SEC",
+   "class": "defaulted",
+   "default": "86400",
+   "description": "Remove only exited managed workloads older than this many seconds; 0 disables the container janitor.",
+   "targets": []
+  },
+  {
+   "key": "RUNTIME_REAP_INTERVAL_SEC",
+   "class": "defaulted",
+   "default": "3600",
+   "description": "Container janitor sweep interval in seconds; active workloads are never removed.",
+   "targets": []
+  },
+  {
+   "key": "MEETING_SPEECH_URL",
+   "class": "defaulted",
+   "default": "(unset - signed organization meeting delivery unavailable)",
+   "description": "Infrastructure-owned private meeting delivery URL brokered to new bots; acts carry only signed turn capabilities.",
+   "targets": []
   }
  ],
  "capabilities": {
