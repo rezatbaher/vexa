@@ -24,6 +24,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchPersistentBrowser, type BrowserContext } from '@vexa/remote-browser';
 import { startCaptureBridge } from './capture-bridge.js';
+import { ensureMeetingMicUnmuted } from './meeting-dom.js';
 import type { BotPipeline, HintCounters } from './pipeline.js';
 import type { Invocation } from './config.js';
 
@@ -116,6 +117,36 @@ async function main(): Promise<void> {
     check('bot self-name and the signal-less 1:1 tile emit NO hints',
       !hints.some((h) => h.name.includes('Vexa') || h.name === 'Bob OneToOne'), JSON.stringify(hints));
     check('pipeline-received counter moved with the arrivals', hintCounters.received === hints.length && hintCounters.received > 0, JSON.stringify(hintCounters));
+
+    // Real Google-shaped controls: settings is NOT the toggle; React updates later.
+    await page.setContent(`<button aria-label="Microphone settings" onclick="window.settingsClicked=true">settings</button>
+      <button id="mic" aria-label="Turn on microphone" onclick="window.micClicks=(window.micClicks||0)+1;setTimeout(()=>this.setAttribute('aria-label','Turn off microphone'),350)">mic</button>`);
+    await page.evaluate('globalThis.__name = (t, v) => t;');
+    const started = Date.now();
+    check('Google microphone awaits delayed unmute', await ensureMeetingMicUnmuted(page, 'google_meet') && Date.now() - started >= 300);
+    check('microphone control clicked once; settings untouched', await page.evaluate('window.micClicks===1 && !window.settingsClicked'));
+    check('already unmuted microphone stays unmuted', await ensureMeetingMicUnmuted(page, 'google_meet') && await page.evaluate('window.micClicks===1'));
+    await page.evaluate(`document.getElementById('mic').setAttribute('aria-label','Turn on microphone');document.getElementById('mic').onclick=()=>{window.micClicks++}`);
+    check('unconfirmed microphone fails closed without toggling twice', !await ensureMeetingMicUnmuted(page, 'google_meet') && await page.evaluate('window.micClicks===2'));
+
+    // Real Google bridge and speaker scan with the count outside the button.
+    await page.setContent(`<div data-participant-id="self" data-self-name="VOXAI"><span class="notranslate">VOXAI</span></div>
+      <div data-participant-id="human"><span class="notranslate">Alice</span></div>
+      <div><button aria-label="Show everyone">people</button><span id="count">2</span></div>`);
+    await page.addScriptTag({ path: BUNDLE });
+    await page.evaluate('globalThis.__name = (t, v) => t;');
+    const googleStop = await startCaptureBridge(page, { ...inv, platform: 'google_meet' }, pipeline);
+    try {
+      check('sibling count badge proves complete Google roster', await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      check('structural self excluded; human kept', await page.evaluate('JSON.stringify(window.__vexaRoomSnapshot().ids)===JSON.stringify(["human"])'));
+      await page.evaluate('document.getElementById("count").textContent="3"');
+      check('missing participant keeps roster incomplete', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      await page.evaluate('document.getElementById("count").remove()');
+      check('no count cannot infer completeness from visible tiles', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      await page.evaluate('document.querySelector("button").setAttribute("aria-label","Show everyone 2");document.querySelector("button").parentElement.insertAdjacentHTML("beforeend","<span>3</span>")');
+      check('ambiguous count keeps roster incomplete', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
+    } finally { await googleStop(); }
+
   } finally {
     await context.close().catch(() => { /* best-effort */ });
     rmSync(dataDir, { recursive: true, force: true });

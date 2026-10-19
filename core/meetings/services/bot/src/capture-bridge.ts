@@ -1,3 +1,4 @@
+import { ensureMeetingMicUnmuted } from './meeting-dom.js';
 /**
  * Capture bridge (2b) — the browser-resident capture → pipeline pump + the speak path.
  *
@@ -427,8 +428,29 @@ export async function startCaptureBridge(
             if (!/people|participants|show everyone/i.test(label)) continue;
             const numbers = (label + ' ' + String(button.textContent || '')).match(/\d{1,4}/g) || [];
             for (const number of numbers) counts.add(Number(number));
+            // Meet can render the count as a sibling badge, outside the actual button.
+            // Only inspect a bounded control wrapper containing this one button; never
+            // infer completeness from the tiles themselves or from a wider toolbar.
+            let wrapper = button.parentElement;
+            for (let depth = 0; wrapper && depth < 3; depth++, wrapper = wrapper.parentElement) {
+              if (wrapper.querySelectorAll('button,[role="button"]').length !== 1) break;
+              for (const badge of Array.from(wrapper.querySelectorAll('*')) as any[]) {
+                const text = String(badge.textContent || '').trim();
+                if (badge.getClientRects().length && /^\d{1,4}$/.test(text)) counts.add(Number(text));
+              }
+            }
           }
           const complete = counts.size === 1 && counts.has(new Set(state.tiles.map((t: any) => t.id)).size);
+          if (!complete && !(w as any).__vexaRoomProbeLogged) {
+            (w as any).__vexaRoomProbeLogged = true;
+            // Operational structure only: no participant names, IDs, text or credentials.
+            w.logBot?.('[RoomPresence] ' + JSON.stringify({ counts: [...counts], tiles: state.tiles.length,
+              selfMarkers: w.document.querySelectorAll('[data-self-name]').length,
+              tileStructure: Array.from(w.document.querySelectorAll('[data-participant-id]')).slice(0, 8).map((node: any) => ({
+                tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name),
+                flags: Object.fromEntries(Array.from(node.attributes).filter((a: any) => /^(true|false|self|local|you)$/i.test(a.value)).map((a: any) => [a.name, a.value])),
+              })) }));
+          }
           return { ids: tiles.map((t: any) => String(t.id)).sort(), names: Object.fromEntries(tiles.map((t: any) => [String(t.id), String(t.name || 'Unidentified participant')])), complete };
         }
         return { ids: [], names: {}, complete: false };
@@ -597,29 +619,7 @@ export function createSpeakController(page: Page, inv: Invocation, onInterrupt?:
   // MUTED the live mic for the exact playback window (then unmuted it after) → speech was silent.
   // We now click ONLY when the control clearly reports the mic is currently OFF, and we never mute it
   // back (the PA-level mute already keeps the bot silent between speaks).
-  const ensureMicUnmuted = async (): Promise<boolean> => {
-    return await page.evaluate(async ({ platform }) => {
-      const doc = (globalThis as any).document;
-      const labelOf = (b: any) =>
-        (((b?.getAttribute?.('aria-label') || b?.getAttribute?.('data-tooltip') || '') as string)).toLowerCase();
-      // Only click when the label says the mic is OFF (→ clicking turns it ON). If we can't tell,
-      // do NOTHING — a bot that joined unmuted stays unmuted (correct), and we never mute a live mic.
-      const ensure = async (b: any) => {
-        if (b && /turn on|unmute|mic is off|microphone is off/.test(labelOf(b))) {
-          b.click(); await new Promise(r => setTimeout(r, 100));
-        }
-        return !!b && /turn off|mute microphone|mute my|mute audio/.test(labelOf(b)) && !/unmute/.test(labelOf(b));
-      };
-      if (platform === 'teams') return await ensure(doc?.querySelector('#microphone-button'));
-      else if (platform === 'zoom') return await ensure(doc?.querySelector('.join-audio-container__btn'));
-      else {
-        // Google Meet / Jitsi: the mic toggle is identified by its aria-label.
-        const btn = Array.from(doc?.querySelectorAll('[role="button"],button') ?? [])
-          .find((b: any) => /microphone|mute audio/i.test((b as any).getAttribute('aria-label') ?? '')) as any;
-        return await ensure(btn);
-      }
-    }, { platform }).catch(() => false);
-  };
+  const ensureMicUnmuted = () => ensureMeetingMicUnmuted(page, platform);
 
   const controller: SpeakController = {
     async chatStream(id, token): Promise<void> {
