@@ -69,9 +69,6 @@ WAIVED: dict[tuple[str, str], str] = {
     ("PUT", "/bots/{platform}/{native_meeting_id}/config"):
         "Voice/config command to an ACTIVE bot (language/task update) — a bot-command-channel path, "
         "not meeting-api persistence. Deferred with the voice-agent carve; the gateway forwards it.",
-    ("POST", "/bots/{platform}/{native_meeting_id}/speak"):
-        "Voice Agent TTS — a bot-command-channel path (acts.v1 PUBLISH), not meeting-api persistence. "
-        "Deferred with the voice-agent carve; the gateway forwards it.",
 }
 
 
