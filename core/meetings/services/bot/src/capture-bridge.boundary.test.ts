@@ -132,7 +132,7 @@ async function main(): Promise<void> {
     // Real Google bridge and speaker scan with the count outside the button.
     await page.setContent(`<div data-participant-id="self" data-self-name="VOXAI"><span class="notranslate">VOXAI</span></div>
       <div data-participant-id="human"><span class="notranslate">Alice</span></div>
-      <div><button aria-label="Show everyone">people</button><span id="count">2</span></div>`);
+      <div><button aria-label="Show everyone">people</button><span id="count">2</span></div><p>1234</p>`);
     await page.addScriptTag({ path: BUNDLE });
     await page.evaluate('globalThis.__name = (t, v) => t;');
     const googleStop = await startCaptureBridge(page, { ...inv, platform: 'google_meet' }, pipeline);
@@ -141,6 +141,10 @@ async function main(): Promise<void> {
       check('structural self excluded; human kept', await page.evaluate('JSON.stringify(window.__vexaRoomSnapshot().ids)===JSON.stringify(["human"])'));
       await page.evaluate('document.getElementById("count").textContent="3"');
       check('missing participant keeps roster incomplete', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
+      // The one-shot provider-drift probe must never publish participant content.
+      for (let attempt = 0; attempt < 60 && !pageLogs.some(line => line.startsWith('[RoomPresence]')); attempt++) await sleep(100);
+      const probe = pageLogs.find(line => line.startsWith('[RoomPresence]')) || '';
+      check('presence probe contains control structure only', !!probe && !/1234|Alice|VOXAI|\"human\"|\"self\"/.test(probe));
       await page.evaluate('document.getElementById("count").remove()');
       check('no count cannot infer completeness from visible tiles', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
       await page.evaluate('document.querySelector("button").setAttribute("aria-label","Show everyone 2");document.querySelector("button").parentElement.insertAdjacentHTML("beforeend","<span>3</span>")');

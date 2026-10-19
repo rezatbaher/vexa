@@ -417,6 +417,7 @@ export async function startCaptureBridge(
           log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
           onSpeaking: (name: string, ended: boolean) => w.__vexaRoomActivity?.(name, ended),
         });
+      const roomProbeAfter = Date.now() + 5000;
       w.__vexaRoomSnapshot = () => {
         const state = w.__vexaGmeetSpeakers?.getState?.();
         if (state) {
@@ -433,7 +434,9 @@ export async function startCaptureBridge(
             // infer completeness from the tiles themselves or from a wider toolbar.
             let wrapper = button.parentElement;
             for (let depth = 0; wrapper && depth < 3; depth++, wrapper = wrapper.parentElement) {
-              if (wrapper.querySelectorAll('button,[role="button"]').length !== 1) break;
+              if (wrapper === w.document.body || wrapper === w.document.documentElement
+                || wrapper.querySelector('[data-participant-id],[data-message-id],[data-sender-id],[role="log"],textarea,[contenteditable="true"]')
+                || wrapper.querySelectorAll('button,[role="button"]').length !== 1) break;
               for (const badge of Array.from(wrapper.querySelectorAll('*')) as any[]) {
                 const text = String(badge.textContent || '').trim();
                 if (badge.getClientRects().length && /^\d{1,4}$/.test(text)) counts.add(Number(text));
@@ -441,14 +444,40 @@ export async function startCaptureBridge(
             }
           }
           const complete = counts.size === 1 && counts.has(new Set(state.tiles.map((t: any) => t.id)).size);
-          if (!complete && !(w as any).__vexaRoomProbeLogged) {
+          if (!complete && Date.now() >= roomProbeAfter && !(w as any).__vexaRoomProbeLogged) {
             (w as any).__vexaRoomProbeLogged = true;
             // Operational structure only: no participant names, IDs, text or credentials.
-            w.logBot?.('[RoomPresence] ' + JSON.stringify({ counts: [...counts], tiles: state.tiles.length,
+            w.logBot?.('[RoomPresence] ' + JSON.stringify({ countCandidates: counts.size, expectedCountObserved: counts.has(new Set(state.tiles.map((t: any) => t.id)).size), tiles: state.tiles.length,
               selfMarkers: w.document.querySelectorAll('[data-self-name]').length,
+              // Only generic UI-control metadata and booleans; never names, IDs or
+              // full DOM/text. This probe diagnoses provider markup drift safely.
+              controls: (Array.from(w.document.querySelectorAll('[aria-label],[data-tooltip]')) as any[])
+                .filter(node => /^(people|participants|show everyone|everyone)(?:\s|$)/i.test(String(node.getAttribute('aria-label') || node.getAttribute('data-tooltip') || '')))
+                .slice(0, 12).map(node => {
+                  const wrappers = []; let parent = node;
+                  for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
+                    const numericLeaves = (Array.from(parent.querySelectorAll('*')) as any[])
+                      .filter(child => child.children.length === 0 && child.getClientRects().length)
+                      .map(child => String(child.textContent || '').trim()).filter(text => /^\d{1,4}$/.test(text));
+                    wrappers.push({ tag: parent.tagName, buttons: parent.querySelectorAll('button,[role="button"]').length,
+                      numericLeaves: numericLeaves.length, matchingTileCount: numericLeaves.filter(text => Number(text) === state.tiles.length).length });
+                  }
+                  return { tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name), wrappers };
+                }),
+              localMarkers: (Array.from(w.document.querySelectorAll('*')) as any[]).slice(0, 3000).flatMap(node =>
+                Array.from(node.attributes).filter((a: any) => /self|local/i.test(a.name)).map((a: any) => ({
+                  attribute: a.name, flag: /^(true|false)$/i.test(a.value) ? a.value : null,
+                  participantIndex: state.tiles.findIndex((t: any) => t.id === node.closest('[data-participant-id]')?.getAttribute('data-participant-id')),
+                }))).slice(0, 24),
               tileStructure: Array.from(w.document.querySelectorAll('[data-participant-id]')).slice(0, 8).map((node: any) => ({
                 tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name),
-                flags: Object.fromEntries(Array.from(node.attributes).filter((a: any) => /^(true|false|self|local|you)$/i.test(a.value)).map((a: any) => [a.name, a.value])),
+                flags: Object.fromEntries(Array.from(node.attributes).filter((a: any) => /^(true|false)$/i.test(a.value)).map((a: any) => [a.name, a.value])),
+                descendants: [...new Set((Array.from(node.querySelectorAll('*')) as any[]).flatMap(child => Array.from(child.attributes).map((a: any) => a.name)))],
+                media: (Array.from(node.querySelectorAll('audio,video')) as any[]).map(media => ({
+                  tag: media.tagName, tracks: media.srcObject?.getTracks?.().map((track: any) => ({
+                    kind: track.kind, settingsKeys: Object.keys(track.getSettings?.() || {}),
+                  })) || [],
+                })),
               })) }));
           }
           return { ids: tiles.map((t: any) => String(t.id)).sort(), names: Object.fromEntries(tiles.map((t: any) => [String(t.id), String(t.name || 'Unidentified participant')])), complete };
