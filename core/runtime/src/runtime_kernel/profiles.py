@@ -108,6 +108,7 @@ def default_registry() -> ProfileRegistry:
             # forward them from the runtime env so the speak act can synthesize (e.g. Kokoro).
             "TTS_SERVICE_URL",
             "TTS_API_TOKEN",
+            "MEETING_SPEECH_URL",
         )
         if os.environ.get(key, "").strip()
     }

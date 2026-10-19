@@ -122,6 +122,8 @@ function teeActs(source: ActsSource, voice: (act: Act) => void | Promise<void>):
 function voiceHandler(speak: SpeakController): (act: Act) => Promise<void> {
   return async (act) => {
     if (act.action === 'speak') await speak.speak(act.text, act.voice);
+    else if (act.action === 'speak_stream') await speak.stream(act.speech_id, act.stream_token);
+    else if (act.action === 'chat_stream') await speak.chatStream(act.speech_id, act.stream_token);
     else if (act.action === 'speak_stop') await speak.stop();
     else if (act.action === 'chat_send') await speak.sendChat(act.text);
   };
@@ -218,6 +220,20 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // the page.evaluate on the BLANK pre-navigation page (no VexaBrowserUtils, no audio), and the
     // subsequent goto to the meeting URL destroyed that context — so capture never attached. (L4.)
     const sess = session, bp = botPipeline, rec = recording;
+    const speak = createSpeakController(session.page, inv, () => {
+      void transcriptClient.publish(`tc:meeting:${meetingId}:mutable`, JSON.stringify({
+        type: 'meeting.activity.v1', meeting: { id: meetingId }, duration_ms: 300, observed_at: new Date().toISOString(),
+      })).catch(() => {});
+    });
+    let presenceAt = 0;
+    const presence = (ids: string[], names: Record<string, string>, complete: boolean): void => {
+      const changed = speak.presence(ids, complete);
+      if (!changed && Date.now() - presenceAt < 2000) return;
+      presenceAt = Date.now();
+      void transcriptClient.publish(`tc:meeting:${meetingId}:mutable`, JSON.stringify({
+        type: 'meeting.presence.v1', meeting: { id: meetingId }, ids, names, complete, revision: speak.roomRevision(), observed_at: new Date().toISOString(),
+      })).catch(() => {});
+    };
     // In-meeting chat (jitsi lane) → a transcript.v1 `chat` segment: the sender is the
     // speaker, the wall clock is the timing (epoch seconds, like the audio lanes), and
     // `completed` is immediate — a chat line has no draft phase.
@@ -242,7 +258,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
-      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat),   // on the live meeting page
+      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, presence, speak.activity),
       startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
       engine: bp,
       onFault: (stage, e) => {
@@ -250,7 +266,6 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       },
     });
     // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
-    const speak = createSpeakController(session.page, inv);
     acts = teeActs(liveActs, voiceHandler(speak));
   } catch (e) {
     console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);

@@ -27,6 +27,8 @@ that isn't active (or wasn't spawned voice-enabled) → 404.
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -78,7 +80,19 @@ def build_voice_router(repo: MeetingRepo, publisher: CommandPublisher) -> APIRou
         text = body.get("text")
         audio_b64 = body.get("audio_base64")
         audio_url = body.get("audio_url")
-        if audio_b64 or audio_url:
+        if body.get("speech_id") or body.get("stream_token"):
+            try:
+                speech_id = str(uuid.UUID(body["speech_id"]))
+                token = body["stream_token"]
+                if not isinstance(token, str) or len(token) > 2048 or not re.fullmatch(r"[\w-]+\.[\w-]+\.[\w-]+", token):
+                    raise ValueError()
+            except (KeyError, ValueError, TypeError, AttributeError):
+                raise HTTPException(422, "A speech ID and signed capability are required") from None
+            delivery = body.get("delivery", "voice")
+            if delivery not in ("voice", "chat"):
+                raise HTTPException(422, "Unsupported meeting delivery")
+            act = {"action": "chat_stream" if delivery == "chat" else "speak_stream", "speech_id": speech_id, "stream_token": token}
+        elif audio_b64 or audio_url:
             act: dict = {"action": "speak_audio"}
             if audio_url:
                 act["url"] = audio_url
@@ -91,7 +105,7 @@ def build_voice_router(repo: MeetingRepo, publisher: CommandPublisher) -> APIRou
         else:
             raise HTTPException(status_code=422, detail="speak requires text, audio_base64, or audio_url")
         await _publish(mid, act)
-        return {"status": "speaking", "meeting_id": mid}
+        return {"status": "accepted" if act["action"] in ("speak_stream", "chat_stream") else "speaking", "meeting_id": mid}
 
     @router.delete("/bots/{platform}/{native_meeting_id}/speak")
     async def speak_stop(

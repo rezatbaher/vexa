@@ -1203,6 +1203,48 @@
      "external-image": "vexaai/dashboard"
     }
    ]
+  },
+  {
+   "unique-id": "acts.v2",
+   "node-type": "contract",
+   "name": "acts.v2",
+   "description": "acts.v2 — adds audience-bound speech capabilities; v1 remains frozen",
+   "metadata": [
+    {
+     "path": "core/meetings/contracts/acts.v2",
+     "domain": "meetings"
+    }
+   ]
+  },
+  {
+   "unique-id": "meeting-speech",
+   "node-type": "service",
+   "name": "meeting-speech",
+   "description": "Organization-owned Pathwarden speech capabilities and 24k PCM",
+   "metadata": [
+    {
+     "domain": "platform",
+     "external": true
+    }
+   ],
+   "interfaces": [
+    {
+     "unique-id": "meeting-speech-http",
+     "type": "api"
+    }
+   ]
+  },
+  {
+   "unique-id": "room-presence.v1",
+   "node-type": "contract",
+   "name": "room-presence.v1",
+   "description": "Browser presence and sustained human activity, never an identity grant",
+   "metadata": [
+    {
+     "path": "core/meetings/contracts/room-presence.v1",
+     "domain": "meetings"
+    }
+   ]
   }
  ],
  "relationships": [
@@ -1299,7 +1341,9 @@
       "bot-commands",
       "segments-table",
       "recording-blob",
-      "userdata-blob"
+      "userdata-blob",
+      "acts.v2",
+      "room-presence.v1"
      ]
     }
    }
@@ -1616,7 +1660,8 @@
      "nodes": [
       "redis",
       "postgres",
-      "minio"
+      "minio",
+      "meeting-speech"
      ]
     }
    }
@@ -2231,6 +2276,42 @@
       "postgres",
       "minio",
       "transcription"
+     ]
+    }
+   }
+  },
+  {
+   "unique-id": "bot-meeting-speech",
+   "relationship-type": {
+    "connects": {
+     "source": {
+      "node": "bot"
+     },
+     "destination": {
+      "node": "meeting-speech",
+      "interface": "meeting-speech-http"
+     }
+    }
+   },
+   "description": "Pull signed generation-bound PCM and report actual playback via MEETING_SPEECH_URL",
+   "protocol": "HTTPS",
+   "metadata": [
+    {
+     "access": "call"
+    }
+   ],
+   "controls": {
+    "data-egress": {
+     "description": "STT is first-party and self-hostable; default destination is tenant-hosted, so audio need not leave the tenant",
+     "requirements": [
+      {
+       "requirement-url": "https://vexa.ai/calm/controls/no-egress.requirement.json",
+       "config": {
+        "dataClass": "audio",
+        "destination": "tenant-hosted",
+        "egressApproved": true
+       }
+      }
      ]
     }
    }

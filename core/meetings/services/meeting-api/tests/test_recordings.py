@@ -64,6 +64,25 @@ def _client_for(repo, storage):
     return TestClient(app)
 
 
+@pytest.mark.parametrize("sequences,earliest,latest,aligned", [
+    ([0, 1], "2026-10-19T10:00:00Z", "2026-10-19T10:00:03Z", True),
+    ([0, 2], "2026-10-19T10:00:00Z", "2026-10-19T10:00:03Z", False),
+    ([0, 1], "2026-10-19T10:00:00Z", None, False),
+    ([0, 1], "2026-10-19T10:00:03Z", "2026-10-19T10:00:00Z", False),
+    ([0, 1], "2026-10-19T10:00:00Z", "2026-10-19T10:01:00Z", False),
+])
+async def test_recording_timeline_requires_bounded_origin_and_every_chunk(sequences, earliest, latest, aligned):
+    repo, storage = _seeded()
+    for index, seq in enumerate(sequences):
+        await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+            data=b"webm-test-part", media_format="webm", chunk_seq=seq, is_final=index == len(sequences) - 1,
+            capture_origin=earliest, capture_origin_latest=latest)
+    rec = (await repo.get_recordings(MEETING_ID))[0]
+    assert rec["timeline_complete"] is aligned
+    if aligned:
+        assert rec["capture_origin_latest"] == "2026-10-19T10:00:03+00:00"
+
+
 # ── flow: upload folds chunks into JSONB; finalize builds the master ─────────────────────────────
 
 async def test_upload_chunk_writes_recording_jsonb():

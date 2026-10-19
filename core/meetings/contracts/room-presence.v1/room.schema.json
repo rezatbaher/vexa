@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/room-presence.v1",
+  "title": "room-presence.v1",
+  "$defs": {
+    "Presence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "meeting",
+        "ids",
+        "observed_at",
+        "complete",
+        "revision"
+      ],
+      "properties": {
+        "type": {
+          "const": "meeting.presence.v1"
+        },
+        "meeting": {
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "type": [
+                "integer",
+                "string"
+              ]
+            }
+          }
+        },
+        "ids": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "type": "string",
+            "maxLength": 300
+          }
+        },
+        "names": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        }
+      }
+    },
+    "Activity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "meeting",
+        "duration_ms",
+        "observed_at"
+      ],
+      "properties": {
+        "type": {
+          "const": "meeting.activity.v1"
+        },
+        "meeting": {
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "type": [
+                "integer",
+                "string"
+              ]
+            }
+          }
+        },
+        "duration_ms": {
+          "const": 300
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

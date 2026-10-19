@@ -36,6 +36,8 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   database segments-table [writers: meeting-api]
   data-asset recording-blob [writers: bot, meeting-api]
   data-asset userdata-blob [writers: remote-browser, bot]
+  contract acts.v2
+  contract room-presence.v1
 
 system agent  # copilot; owns the processed (cleaned) transcript + signals
   service agent-api
@@ -79,6 +81,7 @@ system platform  # shared infra backing the services
   service redis
   database postgres
   service minio
+  service meeting-speech
 
 edges:
   bot -write-> segments-stream
@@ -127,6 +130,7 @@ edges:
   dashboard -req-> gateway  # dashboard → gateway /ws (live transcript view)
   slim -req-> gateway  # Python client; REST via gateway
   extension -req-> gateway  # browser extension client; live WS via gateway
+  bot -call-> meeting-speech  # Pull signed generation-bound PCM and report actual playback via MEETING_SPEECH_URL
   bot, agent-worker deployed-in runtime
   gateway, meeting-api, agent-api, admin-api, runtime, redis, postgres, minio, transcription deployed-in deploy
 

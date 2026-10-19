@@ -1,0 +1,15 @@
+{
+  "type": "meeting.presence.v1",
+  "meeting": {
+    "id": 1
+  },
+  "ids": [
+    "participant-a"
+  ],
+  "names": {
+    "participant-a": "Display label only"
+  },
+  "observed_at": "2026-10-19T10:00:00Z",
+  "complete": true,
+  "revision": "unique-browser-observation"
+}

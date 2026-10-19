@@ -52,6 +52,8 @@ async def upload_chunk(
     is_final: bool = True,
     duration_seconds: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    capture_origin: Optional[str] = None,
+    capture_origin_latest: Optional[str] = None,
 ) -> dict:
     """Process ONE recording chunk upload. ``token_meeting_id`` is the verified MeetingToken's
     meeting_id (the route verifies the token before calling this).
@@ -59,6 +61,8 @@ async def upload_chunk(
     Returns ``{recording_id, media_file_id, storage_path, status, chunk_seq}``. When the session is
     not yet known and the chunk is non-final, returns ``{"status": "pending"}`` (the bot retries).
     """
+    if not 0 <= chunk_seq <= 20000:
+        raise ValueError("Recording chunk sequence out of range")
     session = await repo.find_session(session_uid)
     if session is None:
         if not is_final:
@@ -104,6 +108,23 @@ async def upload_chunk(
             storage_path=key, file_size=len(data), chunk_seq=chunk_seq, is_final=is_final,
             duration_seconds=duration_seconds, sample_rate=sample_rate,
         )
+        if capture_origin and capture_origin_latest and not payload.get("capture_origin"):
+            try:
+                origin = datetime.fromisoformat(capture_origin.replace("Z", "+00:00"))
+                latest = datetime.fromisoformat(capture_origin_latest.replace("Z", "+00:00"))
+                if origin.tzinfo is not None and latest.tzinfo is not None and 0 <= (latest - origin).total_seconds() <= 30:
+                    payload["capture_origin"] = origin.isoformat()
+                    payload["capture_origin_latest"] = latest.isoformat()
+            except (ValueError, TypeError, AttributeError):
+                pass
+        prior_sequences = (ex or {}).get("received_sequences") or {}
+        prior_sequences = prior_sequences if isinstance(prior_sequences, dict) else {}
+        sequences = sorted(set(prior_sequences.get(media_type, [])) | {chunk_seq})
+        payload["received_sequences"] = {**prior_sequences, media_type: sequences}
+        # Missing chunks make wall-clock clipping unsafe. A legacy/incomplete recording never
+        # advertises an aligned timeline, even if the provider can assemble playable audio.
+        payload["timeline_complete"] = bool(payload.get("capture_origin") and payload.get("capture_origin_latest") and payload["status"] == "completed"
+            and media_format == "webm" and sequences == list(range(max(sequences) + 1)))
         others = [r for r in recs if r.get("id") != rid]
         return others + [payload], (payload, transitioned_)
 

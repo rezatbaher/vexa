@@ -37,6 +37,7 @@ import type { RecordingSink } from './ports.js';
  *  into. The orchestrator only sees close(key); the bridge holds the BotRecordingSink to feed chunks
  *  as they arrive from the page-side recorder. */
 export interface BotRecordingSink extends RecordingSink {
+  started(earliest: string, latest: string): void;
   /** One recording.v1 chunk for `key`: monotonic seq, the COMPLETED-signal flag, format, bytes. */
   chunk(key: string, seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void;
 }
@@ -58,7 +59,7 @@ export interface RecordingSinkOptions {
 /** The default chunk uploader: POST each chunk to meeting-api's internal upload endpoint via the
  *  shipped RecordingService.uploadChunk (multipart, retry+backoff, structured chunk-loss logging).
  *  session_uid is inv.connectionId — the server resolves the eager-created MeetingSession by it. */
-function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkUploader {
+function defaultChunkUploader(inv: Invocation, log: (m: string) => void, origin: () => string | undefined, latest: () => string | undefined): ChunkUploader {
   const url = inv.recordingUploadUrl;
   const meetingId = inv.meeting_id ?? 0;
   const sessionUid = inv.connectionId ?? '';
@@ -69,7 +70,7 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
       log(`recording: no recordingUploadUrl — chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
       return;
     }
-    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format);
+    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format, origin(), latest());
   };
 }
 
@@ -79,7 +80,9 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
  */
 export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecordingSink {
   const log = opts.log ?? (() => { /* silent by default */ });
-  const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log);
+  let origin: string | undefined;
+  let latest: string | undefined;
+  const upload = opts.uploadChunk ?? defaultChunkUploader(opts.inv, log, () => origin, () => latest);
 
   let queue: Promise<void> = Promise.resolve();       // serialize uploads → parts land in seq order
   let anyChunk = false;                                // did the tap ever deliver a chunk?
@@ -98,6 +101,7 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   };
 
   return {
+    started: (a, b) => { if (!origin && Number.isFinite(Date.parse(a)) && Date.parse(b) >= Date.parse(a)) { origin = a; latest = b; } },
     chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one

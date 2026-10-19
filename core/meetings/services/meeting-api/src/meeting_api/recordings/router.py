@@ -168,6 +168,8 @@ def build_router(
                 media_type=media_type, media_format=media_format,
                 chunk_seq=chunk_seq, is_final=is_final,
                 duration_seconds=duration_seconds, sample_rate=sample_rate,
+                capture_origin=meta.get("capture_origin"),
+                capture_origin_latest=meta.get("capture_origin_latest"),
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -232,6 +234,9 @@ def build_router(
             "media_file_id": media_file_id,
             "raw_url": raw_url,
             "duration_seconds": (mf or {}).get("duration_seconds"),
+            "capture_origin": rec.get("capture_origin"),
+            "capture_origin_latest": rec.get("capture_origin_latest"),
+            "timeline_complete": rec.get("timeline_complete", False),
         })
 
     @router.get("/recordings/{recording_id}/media/{media_file_id}/raw")

@@ -39,7 +39,7 @@ export interface RecordingTapOptions {
   /** Receives each chunk. Return false / throw → the chunk is spliced anyway (reconciler re-fetches). */
   onChunk: (chunk: RecordingChunk) => Promise<boolean> | boolean;
   /** Fired ONCE on MediaRecorder.onstart — t=0 of the master (segment↔audio alignment). */
-  onStarted?: () => void;
+  onStarted?: (earliest: string, latest: string) => void;
 }
 
 export interface MediaRecorderChunkerOptions extends RecordingTapOptions {
@@ -120,7 +120,8 @@ export class MediaRecorderChunker implements RecordingTap {
     this.mimeType = recorder.mimeType || chosen || "audio/webm";
 
     // t=0 of the master — listeners align segment timestamps to audio origin.
-    recorder.onstart = () => { try { this.opts.onStarted?.(); } catch { /* */ } };
+    let earliest = '';
+    recorder.onstart = () => { try { this.opts.onStarted?.(earliest, new Date().toISOString()); } catch { /* */ } };
 
     recorder.ondataavailable = async (event: BlobEvent) => {
       if (!(event.data && event.data.size > 0)) {
@@ -207,6 +208,7 @@ export class MediaRecorderChunker implements RecordingTap {
       }
     };
 
+    earliest = new Date().toISOString();
     recorder.start(this.opts.timesliceMs ?? 15000);
     blog(`[record-chunker] MediaRecorder started (${this.mimeType}, timeslice=${this.opts.timesliceMs ?? 15000}ms)`);
   }

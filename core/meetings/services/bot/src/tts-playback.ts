@@ -21,7 +21,7 @@ import http from 'node:http';
 
 const PAPLAY_ARGS = ['--raw', '--format=s16le', '--rate=24000', '--channels=1', '--device=tts_sink'];
 
-function setTtsMute(muted: boolean, log: (m: string) => void): void {
+export function setTtsMute(muted: boolean, log: (m: string) => void = () => {}): void {
   const v = muted ? '1' : '0';
   try {
     execSync(`pactl set-sink-mute tts_sink ${v}`, { stdio: 'pipe' });
@@ -50,8 +50,16 @@ export interface TtsPlayback {
 /** Build a TtsPlayback that streams the TTS service's PCM straight to paplay. */
 export function createTtsPlayback(log: (m: string) => void = () => { /* */ }): TtsPlayback {
   let proc: ChildProcess | null = null;
+  let request: http.ClientRequest | undefined;
+  let response: http.IncomingMessage | undefined;
+  let epoch = 0;
+  let cancelled: (() => void) | undefined;
 
   const stop = (): void => {
+    epoch++;
+    cancelled?.(); cancelled = undefined;
+    request?.destroy(); request = undefined;
+    response?.destroy(); response = undefined;
     if (proc) {
       try { proc.stdin?.destroy(); proc.kill('SIGKILL'); } catch { /* */ }
       proc = null;
@@ -60,6 +68,8 @@ export function createTtsPlayback(log: (m: string) => void = () => { /* */ }): T
   };
 
   const speak = async (text: string, voice = 'auto'): Promise<void> => {
+    stop();
+    const own = epoch;
     const base = process.env.TTS_SERVICE_URL?.trim();
     if (!base) { log('[tts] TTS_SERVICE_URL not set — speak is a no-op'); return; }
     const postData = JSON.stringify({ model: 'tts-1', input: text, voice, response_format: 'pcm' });
@@ -74,6 +84,7 @@ export function createTtsPlayback(log: (m: string) => void = () => { /* */ }): T
     if (token) headers['X-API-Key'] = token;
 
     await new Promise<void>((resolve) => {
+      cancelled = resolve;
       const req = (url.protocol === 'https:' ? https : http).request({
         hostname: url.hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -81,20 +92,26 @@ export function createTtsPlayback(log: (m: string) => void = () => { /* */ }): T
         method: 'POST',
         headers,
       }, (res) => {
+        if (own !== epoch) { res.destroy(); return; }
+        response = res;
         if (res.statusCode !== 200) {
-          let body = ''; res.on('data', (c) => (body += c));
-          res.on('end', () => { log(`[tts] service ${res.statusCode}: ${body.slice(0, 120)}`); resolve(); });
+          res.resume();
+          res.on('end', () => { log(`[tts] service status ${res.statusCode}`); resolve(); });
           return;
         }
         setTtsMute(false, log);                       // open the mic only during playback
         const p = spawn('paplay', PAPLAY_ARGS, { stdio: ['pipe', 'pipe', 'pipe'] });
         proc = p;
         p.stderr?.on('data', (d: Buffer) => log(`[tts] paplay: ${d.toString().trim()}`));
-        const done = () => { if (proc === p) proc = null; setTtsMute(true, log); resolve(); };
+        const done = () => { if (proc === p) proc = null; if (own === epoch) setTtsMute(true, log); resolve(); };
         p.on('exit', done);
         p.on('error', (e) => { log(`[tts] paplay error: ${String(e)}`); done(); });
         res.pipe(p.stdin!);                           // stream PCM straight to the mic sink
+        res.on('error', done);
+        p.stdin?.on('error', done);
       });
+      request = req;
+      req.setTimeout(45000, () => { req.destroy(); resolve(); });
       req.on('error', (e) => { log(`[tts] request error: ${String(e)}`); resolve(); });
       req.write(postData); req.end();
     });

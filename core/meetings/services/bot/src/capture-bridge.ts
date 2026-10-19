@@ -41,7 +41,9 @@ import { isMixedLanePlatform, type Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
 import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
-import { createTtsPlayback } from './tts-playback.js';
+import { createTtsPlayback, setTtsMute } from './tts-playback.js';
+import { createMeetingSpeech, failMeetingSpeech } from './meeting-speech.js';
+import { deliverMeetingChat } from './meeting-chat.js';
 
 /** Float32 PCM → base64 of its little-endian bytes — the EXACT codec wire payload, so a stored
  *  captured-signal.v1 frame round-trips through @vexa/capture-codec (encode→decode→same PCM). */
@@ -257,6 +259,8 @@ export async function startCaptureBridge(
   /** In-meeting chat sink (jitsi lane) — each captured chat message crosses here;
    *  the composition root publishes it as a transcript.v1 `source:'chat'` segment. */
   onChat?: (sender: string, text: string) => void,
+  onPresence?: (ids: string[], names: Record<string, string>, complete: boolean) => void,
+  onActivity?: (name: string, ended: boolean) => void,
 ): Promise<() => Promise<void>> {
   const mixed = isMixedLanePlatform(inv.platform);
   const jitsi = inv.platform === 'jitsi';
@@ -304,6 +308,8 @@ export async function startCaptureBridge(
   });
   await page.exposeFunction('__vexaNamedAudioData', onNamedAudio).catch(() => { /* optional */ });
   await page.exposeFunction('__vexaSpeakerHint', onSpeakerHint).catch(() => { /* optional */ });
+  await page.exposeFunction('__vexaRoomPresence', (ids: string[], names: Record<string, string>, complete: boolean) => onPresence?.(ids, names, complete)).catch(() => {});
+  await page.exposeFunction('__vexaRoomActivity', (name: string, ended: boolean) => onActivity?.(name, ended)).catch(() => {});
   // jitsi/gmeet chat → the embedder's sink (a transcript.v1 `chat` segment at the composition root).
   await page.exposeFunction('__vexaChatMessage', (sender: string, text: string): void => {
     try { onChat?.(sender, text); } catch (e) { console.error(`[bot] chat sink rejected: ${String(e)}`); }
@@ -405,7 +411,32 @@ export async function startCaptureBridge(
     // gmeet lane: per-channel capture + glow attribution (the SAME module the extension runs).
     if (w.VexaBrowserUtils?.createGmeetCapture && !w.__vexaGmeetCapture) {
       w.__vexaGmeetSpeakers = w.__vexaGmeetSpeakers
-        ?? w.VexaBrowserUtils.createGmeetSpeakers?.({ log: (m: string) => w.logBot?.('[PerSpeaker] ' + m) });
+        ?? w.VexaBrowserUtils.createGmeetSpeakers?.({
+          selfName: botName, pollMs: 100,
+          log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
+          onSpeaking: (name: string, ended: boolean) => w.__vexaRoomActivity?.(name, ended),
+        });
+      w.__vexaRoomSnapshot = () => {
+        const state = w.__vexaGmeetSpeakers?.getState?.();
+        if (state) {
+          const tiles = state.tiles.filter((t: any) => !t.self);
+          const buttons = Array.from(w.document.querySelectorAll('button,[role="button"]')) as any[];
+          const counts = new Set<number>();
+          for (const button of buttons) {
+            const label = String(button.getAttribute('aria-label') || button.getAttribute('data-tooltip') || '');
+            if (!/people|participants|show everyone/i.test(label)) continue;
+            const numbers = (label + ' ' + String(button.textContent || '')).match(/\d{1,4}/g) || [];
+            for (const number of numbers) counts.add(Number(number));
+          }
+          const complete = counts.size === 1 && counts.has(new Set(state.tiles.map((t: any) => t.id)).size);
+          return { ids: tiles.map((t: any) => String(t.id)).sort(), names: Object.fromEntries(tiles.map((t: any) => [String(t.id), String(t.name || 'Unidentified participant')])), complete };
+        }
+        return { ids: [], names: {}, complete: false };
+      };
+      w.__vexaRosterTimer = (globalThis as any).setInterval(() => {
+        const state = w.__vexaRoomSnapshot();
+        w.__vexaRoomPresence?.(state.ids, state.names, state.complete);
+      }, 250);
       w.__vexaGmeetCapture = w.VexaBrowserUtils.createGmeetCapture({
         log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
         onAudio: (index: number, pcm: Float32Array) => {
@@ -447,6 +478,7 @@ export async function startCaptureBridge(
       try { if (w.__vexaMixedCapture && typeof w.__vexaMixedCapture.stop === 'function') w.__vexaMixedCapture.stop(); } catch { /* best-effort */ }
       try { w.__vexaMixCtx?.close?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetSpeakers?.destroy?.(); } catch { /* best-effort */ }
+      try { (globalThis as any).clearInterval(w.__vexaRosterTimer); } catch { /* */ }
     }).catch(() => { /* page already gone */ });
   };
 }
@@ -464,6 +496,7 @@ export async function startCaptureBridge(
  * participant <audio> elements exist), exactly like the capture bridge.
  */
 export async function startRecording(page: Page, inv: Invocation, recording: BotRecordingSink): Promise<() => Promise<void>> {
+  await page.exposeFunction('__vexaRecordingStarted', (earliest: string, latest: string) => recording.started(earliest, latest)).catch(() => {});
   const key = `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`;
   // Recording part interval (ms): the MediaRecorder timeslice = the durable-upload granularity.
   // Env-overridable (VEXA_RECORDING_TIMESLICE_MS) so a live multi-part run can shrink it to land
@@ -488,6 +521,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
     if (w.VexaBrowserUtils?.createRecordingTap && !w.__vexaRecordingTap) {
       w.__vexaRecordingTap = w.VexaBrowserUtils.createRecordingTap({
         timesliceMs,
+        onStarted: (earliest: string, latest: string) => w.__vexaRecordingStarted?.(earliest, latest),
         onChunk: async (c: { base64: string; chunkSeq: number; isFinal: boolean; mimeType: string }) => {
           try { await w.__vexaRecordingChunk(c.base64, c.chunkSeq, c.isFinal, c.mimeType); return true; }
           catch { return false; }
@@ -521,18 +555,38 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
  * the OS-level audio injection the VM image provides. Speaking is gated on inv.voiceAgentEnabled.
  */
 export interface SpeakController {
+  stream(id: string, token: string): Promise<void>;
+  chatStream(id: string, token: string): Promise<void>;
+  activity(name: string, ended: boolean): void;
+  presence(ids: string[], complete: boolean): boolean;
+  roomRevision(): string;
   /** Begin speaking `text` (TTS synthesized + injected via the VM's PulseAudio chain). */
   speak(text: string, voice?: string): Promise<void>;
   /** Stop any in-flight speech (barge-in). */
   stop(): Promise<void>;
   /** Post `text` into the meeting's chat panel (acts.v1 `chat_send`). Best-effort DOM drive. */
-  sendChat(text: string): Promise<void>;
+  sendChat(text: string, expectedRoom?: string, expectedEpoch?: number): Promise<boolean>;
 }
 
-export function createSpeakController(page: Page, inv: Invocation): SpeakController {
+export function createSpeakController(page: Page, inv: Invocation, onInterrupt?: () => void): SpeakController {
   const enabled = !!inv.voiceAgentEnabled;
   const platform = inv.platform;
   const tts = createTtsPlayback((m) => console.log(`[bot] ${m}`));   // OS-level TTS→tts_sink half
+  const stream = createMeetingSpeech(value => setTtsMute(value));
+  let speechEpoch = 0;
+  let room = '';
+  let roomRevision = '';
+  const advance = (): number => {
+    const value = ++speechEpoch;
+    void page.evaluate((epoch: number) => { (globalThis as any).__vexaSpeechEpoch = epoch; }, value).catch(() => {});
+    return value;
+  };
+  const permittedRoom = (token: string): boolean => {
+    try { return !!roomRevision && JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).room === roomRevision; }
+    catch { return false; }
+  };
+  const speechTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const chats = new Set<string>();
 
   // Toggle the meeting-UI mic button so the bot is audible only while speaking (production
   // unmutes before speech + auto-mutes after — index.ts:1039–1059). The PulseAudio source
@@ -543,42 +597,98 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
   // MUTED the live mic for the exact playback window (then unmuted it after) → speech was silent.
   // We now click ONLY when the control clearly reports the mic is currently OFF, and we never mute it
   // back (the PA-level mute already keeps the bot silent between speaks).
-  const ensureMicUnmuted = async (): Promise<void> => {
-    await page.evaluate(({ platform }) => {
+  const ensureMicUnmuted = async (): Promise<boolean> => {
+    return await page.evaluate(async ({ platform }) => {
       const doc = (globalThis as any).document;
       const labelOf = (b: any) =>
         (((b?.getAttribute?.('aria-label') || b?.getAttribute?.('data-tooltip') || '') as string)).toLowerCase();
       // Only click when the label says the mic is OFF (→ clicking turns it ON). If we can't tell,
       // do NOTHING — a bot that joined unmuted stays unmuted (correct), and we never mute a live mic.
-      const clickIfOff = (b: any) => { if (b && /turn on|unmute|mic is off|microphone is off/.test(labelOf(b))) b.click(); };
-      if (platform === 'teams') clickIfOff(doc?.querySelector('#microphone-button'));
-      else if (platform === 'zoom') clickIfOff(doc?.querySelector('.join-audio-container__btn'));
+      const ensure = async (b: any) => {
+        if (b && /turn on|unmute|mic is off|microphone is off/.test(labelOf(b))) {
+          b.click(); await new Promise(r => setTimeout(r, 100));
+        }
+        return !!b && /turn off|mute microphone|mute my|mute audio/.test(labelOf(b)) && !/unmute/.test(labelOf(b));
+      };
+      if (platform === 'teams') return await ensure(doc?.querySelector('#microphone-button'));
+      else if (platform === 'zoom') return await ensure(doc?.querySelector('.join-audio-container__btn'));
       else {
         // Google Meet / Jitsi: the mic toggle is identified by its aria-label.
         const btn = Array.from(doc?.querySelectorAll('[role="button"],button') ?? [])
           .find((b: any) => /microphone|mute audio/i.test((b as any).getAttribute('aria-label') ?? '')) as any;
-        clickIfOff(btn);
+        return await ensure(btn);
       }
-    }, { platform }).catch(() => { /* best-effort UI drive */ });
+    }, { platform }).catch(() => false);
   };
 
-  return {
+  const controller: SpeakController = {
+    async chatStream(id, token): Promise<void> {
+      if (!enabled || !permittedRoom(token) || chats.has(id) || chats.size >= 5000) return;
+      chats.add(id);
+      const own = advance();
+      tts.stop(); stream.stop();
+      const audience = room;
+      await deliverMeetingChat(id, token, () => own === speechEpoch && room === audience,
+        text => controller.sendChat(text, audience, own));
+    },
+    activity(name, ended): void {
+      if (ended) { clearTimeout(speechTimers.get(name)); speechTimers.delete(name); return; }
+      if (speechTimers.has(name)) return;
+      speechTimers.set(name, setTimeout(() => { advance(); stream.stop(); tts.stop(); onInterrupt?.(); }, 300));
+    },
+    presence(ids, complete): boolean {
+      const next = JSON.stringify({ ids: [...new Set(ids)].sort(), complete });
+      if (next === room) return false;
+      room = next; roomRevision = globalThis.crypto.randomUUID(); advance(); stream.stop(); tts.stop();
+      return true;
+    },
+    roomRevision: () => roomRevision,
+    async stream(id: string, token: string): Promise<void> {
+      if (!enabled || !permittedRoom(token)) return;
+      const own = advance();
+      tts.stop();
+      if (speechTimers.size) {
+        const pending = stream.speak(id, token); stream.stop(); await pending;
+        return;
+      }
+      const audible = await ensureMicUnmuted();
+      if (own !== speechEpoch) return;
+      if (!audible) { await failMeetingSpeech(id, token); return; }
+      if (speechTimers.size) {
+        const pending = stream.speak(id, token); stream.stop(); await pending;
+        return;
+      }
+      const audience = room;
+      await stream.speak(id, token, async () => {
+        if (own !== speechEpoch || !permittedRoom(token)) return false;
+        return await page.evaluate(({ expectedRoom, epoch }) => {
+          const g = globalThis as any;
+          const snapshot = g.__vexaRoomSnapshot?.();
+          return g.__vexaSpeechEpoch === epoch && !!snapshot &&
+            JSON.stringify({ ids: [...new Set(snapshot.ids)].sort(), complete: snapshot.complete }) === expectedRoom;
+        }, { expectedRoom: audience, epoch: own }).catch(() => false);
+      });
+    },
     async speak(text: string, voice?: string): Promise<void> {
+      const own = advance();
+      stream.stop();
       if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return; }
-      console.log(`[bot] speak: "${text.slice(0, 60)}"`);
+      console.log(`[bot] speak: ${text.length} characters`);
       await ensureMicUnmuted();                               // (a) make sure the UI mic is ON (never mutes a live mic)
+      if (own !== speechEpoch) return;
       // (b) synthesize via the TTS service + stream PCM to tts_sink → virtual_mic; audibility is gated
       //     at the PA level (virtual_mic mute) inside tts.speak, so the UI mic just stays on.
       await tts.speak(text, voice).catch((e) => console.error(`[bot] speak: tts failed: ${String(e)}`));
     },
     async stop(): Promise<void> {
       if (!enabled) return;
+      advance();
       tts.stop();                                             // barge-in: kill playback + re-mute tts_sink (PA-level)
+      stream.stop();
       console.log('[bot] speak_stop');
     },
-    async sendChat(text: string): Promise<void> {
-      if (!enabled) { console.error('[bot] chat_send ignored: voiceAgentEnabled is false'); return; }
-      console.log(`[bot] chat_send: "${text.slice(0, 60)}"`);
+    async sendChat(text: string, expectedRoom?: string, expectedEpoch?: number): Promise<boolean> {
+      if (!enabled) return false;
       // Post into the meeting chat via the DOM (no server-side chat backend in the core). Best-effort:
       // open the chat panel if needed, set the input value (native setter so React picks it up),
       // then click Send or press Enter. Meet/Jitsi use an aria-labelled textarea; Teams/Zoom differ.
@@ -586,10 +696,16 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
       // compiles with `lib: ["ES2022"]` and no `dom` lib (tsconfig.base.json), so referencing them
       // is a TS2304 build failure. Every evaluate block in this file therefore reaches the browser
       // through `(globalThis as any)`; keep that idiom.
-      await page.evaluate(async ({ text }) => {
+      return await page.evaluate(async ({ text, expectedRoom, expectedEpoch }) => {
         const g = (globalThis as any);
         const doc = g.document;
-        if (!doc) return;
+        if (!doc) return false;
+        const matches = () => {
+          if (expectedEpoch !== undefined && g.__vexaSpeechEpoch !== expectedEpoch) return false;
+          if (!expectedRoom) return true;
+          const snapshot = g.__vexaRoomSnapshot?.();
+          return !!snapshot && JSON.stringify({ ids: [...new Set(snapshot.ids)].sort(), complete: snapshot.complete }) === expectedRoom;
+        };
         const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
         const findInput = (): any =>
           doc.querySelector('textarea[aria-label*="message" i]')
@@ -605,7 +721,7 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
           await sleep(700);
           input = findInput();
         }
-        if (!input) { console.error('[bot] chat_send: no chat input found'); return; }
+        if (!input || !matches()) return false;
         input.focus();
         const tag = input.tagName;
         if (tag === 'TEXTAREA' || tag === 'INPUT') {
@@ -619,12 +735,19 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
           input.dispatchEvent(new g.Event('input', { bubbles: true }));
         }
         await sleep(200);
-        const send = byLabel(/send a message|send message|^send$/i);
-        if (send && !send.disabled) { send.click(); return; }
-        for (const type of ['keydown', 'keypress', 'keyup']) {
-          input.dispatchEvent(new g.KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+        if (!matches()) {
+          input.value = ''; input.textContent = ''; input.dispatchEvent(new g.Event('input', { bubbles: true }));
+          return false;
         }
-      }, { text }).catch((e: unknown) => console.error(`[bot] chat_send failed: ${String(e)}`));
+        const send = byLabel(/send a message|send message|^send$/i);
+        if (send && !send.disabled) send.click();
+        else for (const type of ['keydown', 'keypress', 'keyup']) {
+            input.dispatchEvent(new g.KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+        }
+        await sleep(150);
+        return !(input.value || input.textContent || '').trim();
+      }, { text, expectedRoom, expectedEpoch }).catch(() => false);
     },
   };
+  return controller;
 }

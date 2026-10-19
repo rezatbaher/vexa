@@ -85,6 +85,8 @@ export type Act =
   | { action: 'leave' }
   | { action: 'reconfigure'; language?: string | null; task?: string | null; allowedLanguages?: string[] }
   | { action: 'speak'; text: string; voice?: string }
+  | { action: 'speak_stream'; speech_id: string; stream_token: string }
+  | { action: 'chat_stream'; speech_id: string; stream_token: string }
   | { action: 'speak_audio'; url?: string; audioBase64?: string }
   | { action: 'speak_stop' }
   | { action: 'chat_send'; text: string }
@@ -98,7 +100,7 @@ export type ActAction = Act['action'];
 
 export const ACT_ACTIONS: readonly ActAction[] = [
   'leave', 'reconfigure',
-  'speak', 'speak_audio', 'speak_stop',
+  'speak', 'speak_stream', 'chat_stream', 'speak_audio', 'speak_stop',
   'chat_send', 'chat_read',
   'screen_show', 'screen_stop', 'avatar_set', 'avatar_reset',
 ];
@@ -110,6 +112,12 @@ export const actsChannel = (meetingId: string | number): string => `bot_commands
 export function parseAct(msg: unknown): Act | null {
   if (!msg || typeof msg !== 'object') return null;
   const action = (msg as { action?: unknown }).action;
+  if (action === 'speak_stream' || action === 'chat_stream') {
+    const value = msg as Record<string, unknown>;
+    if (Object.keys(value).some(k => !['action', 'speech_id', 'stream_token'].includes(k)) ||
+      typeof value.speech_id !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.speech_id) ||
+      typeof value.stream_token !== 'string' || value.stream_token.length > 2048 || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(value.stream_token)) return null;
+  }
   if (typeof action !== 'string' || !(ACT_ACTIONS as readonly string[]).includes(action)) return null;
   return msg as Act;
 }

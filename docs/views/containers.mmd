@@ -26,6 +26,7 @@ flowchart LR
     redis["redis"]
     postgres["postgres"]
     minio["minio"]
+    meeting_speech["meeting-speech"]
   end
   slim["slim"]
   extension["extension"]
@@ -48,3 +49,4 @@ flowchart LR
   dashboard -->|""| gateway
   slim -->|"HTTPS"| gateway
   extension -->|"WebSocket"| gateway
+  bot -->|"HTTPS"| meeting_speech
