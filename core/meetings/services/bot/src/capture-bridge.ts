@@ -323,7 +323,7 @@ export async function startCaptureBridge(
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
-  await page.evaluate(async ({ isMixed, isJitsi, isTeams, isZoom, botName }) => {
+  await page.evaluate(async ({ isMixed, isJitsi, isTeams, isZoom, botName, voiceAgentEnabled }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (isMixed) {
       // Zoom/Teams: installRemoteAudioHook (installed pre-nav) mirrors each remote WebRTC audio
@@ -431,8 +431,10 @@ export async function startCaptureBridge(
           const counts = new Set<number>();
           for (const button of buttons) {
             const label = String(button.getAttribute('aria-label') || button.getAttribute('data-tooltip') || '');
-            const icon = button.querySelector('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined');
-            const peopleIcon = /^(people|people_alt|group|groups|supervisor_account)$/.test(String(icon?.textContent || '').trim());
+            if (!button.getClientRects().length || /chat|message|invite|add (?:people|participants)/i.test(label)) continue;
+            const icons = Array.from(button.querySelectorAll('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined,[data-google-symbols-override]')) as any[];
+            const peopleIcon = icons.some(icon => /^(people|people_alt|group|groups|supervisor_account|\uE7EF|\uE7FB|\uF233)$/.test(String(icon.textContent || '').trim())
+              || /^(people|people_alt|group|groups|supervisor_account)$/.test(String(icon.getAttribute('data-google-symbols-override') || '').trim()));
             if (!/people|participants|show everyone/i.test(label) && !peopleIcon) continue;
             const numbers = (label + ' ' + String(button.textContent || '')).match(/\d{1,4}/g) || [];
             for (const number of numbers) counts.add(Number(number));
@@ -500,6 +502,14 @@ export async function startCaptureBridge(
                   }
                   return { tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name), wrappers };
                 }),
+              panelControls: buttons.filter(button => button.hasAttribute('data-panel-id')).slice(0, 24).map(button => {
+                const label = ['aria-label', 'data-tooltip', 'title'].map(key => button.getAttribute(key) || '').join(' ');
+                return { visible: !!button.getClientRects().length, linked: button.hasAttribute('aria-controls'),
+                  kind: /chat|message/i.test(label) ? 'chat' : /people|participants|show everyone/i.test(label) ? 'people' : 'other',
+                  iconKinds: (Array.from(button.querySelectorAll('i,span,[data-google-symbols-override]')) as any[]).filter(icon => !icon.children.length)
+                    .map(icon => /^(people|people_alt|group|groups|supervisor_account|\uE7EF|\uE7FB|\uF233)$/.test(String(icon.textContent || '').trim()) ? 'people' : 'other').slice(0, 8),
+                  attributes: Array.from(button.attributes).map((a: any) => a.name) };
+              }),
               peopleIcons: (Array.from(w.document.querySelectorAll('button,[role="button"]')) as any[]).filter(button =>
                 /^(people|people_alt|group|groups|supervisor_account)$/.test(String(button.querySelector('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined')?.textContent || '').trim())).length,
               localMarkers: (Array.from(w.document.querySelectorAll('*')) as any[]).slice(0, 3000).flatMap(node =>
@@ -549,12 +559,12 @@ export async function startCaptureBridge(
       w.__vexaGmeetChat = w.VexaBrowserUtils.createGmeetChat({
         // Keep an observed People panel stable; chat can still be opened for explicit
         // delivery. Losing the in-call count invalidates room history immediately.
-        autoOpenPanel: !w.__vexaPeoplePanel,
+        autoOpenPanel: !voiceAgentEnabled,
         log: (m: string) => w.logBot?.('[GmeetChat] ' + m),
         onMessage: (m: { sender: string; text: string }) => w.__vexaChatMessage?.(m.sender, m.text),
       });
     }
-  }, { isMixed: mixed, isJitsi: jitsi, isTeams: inv.platform === 'teams', isZoom: inv.platform === 'zoom', botName: inv.botName }).catch((e) => {
+  }, { isMixed: mixed, isJitsi: jitsi, isTeams: inv.platform === 'teams', isZoom: inv.platform === 'zoom', botName: inv.botName, voiceAgentEnabled: !!inv.voiceAgentEnabled }).catch((e) => {
     console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`); // L4: surfaces only on the VM
   });
 

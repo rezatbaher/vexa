@@ -82,9 +82,15 @@ export async function installLocalMediaTracker(context: BrowserContext): Promise
 export async function ensureMeetingPeoplePanel(page: Page): Promise<boolean> {
   return page.evaluate(async () => {
     const w = globalThis as any, doc = w.document;
-    const candidates = (Array.from(doc.querySelectorAll('button,[role="button"]')) as any[]).filter(button =>
-      button.getClientRects().length && button.hasAttribute('data-panel-id') && button.hasAttribute('aria-controls')
-      && /people|participants|everyone/i.test(String(button.getAttribute('aria-label') || button.getAttribute('data-tooltip') || '')));
+    const candidates = (Array.from(doc.querySelectorAll('button,[role="button"]')) as any[]).filter(button => {
+      const label = ['aria-label', 'data-tooltip', 'title'].map(key => button.getAttribute(key) || '').join(' ');
+      if (!button.getClientRects().length || !button.hasAttribute('data-panel-id') || !button.hasAttribute('aria-controls')
+        || /chat|message|invite|add (?:people|participants)/i.test(label)) return false;
+      const icons = Array.from(button.querySelectorAll('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined,[data-google-symbols-override]')) as any[];
+      const peopleIcon = icons.some(icon => /^(people|people_alt|group|groups|supervisor_account|\uE7EF|\uE7FB|\uF233)$/.test(String(icon.textContent || '').trim())
+        || /^(people|people_alt|group|groups|supervisor_account)$/.test(String(icon.getAttribute('data-google-symbols-override') || '').trim()));
+      return /\bpeople\b|\bparticipants\b|show everyone/i.test(label) || peopleIcon;
+    });
     if (candidates.length !== 1) return false;
     const button = candidates[0], target = String(button.getAttribute('aria-controls') || '').trim();
     if (!target || /\s/.test(target)) return false;

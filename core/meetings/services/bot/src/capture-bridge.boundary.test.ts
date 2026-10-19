@@ -174,6 +174,9 @@ async function main(): Promise<void> {
     await page.evaluate('globalThis.__name = (t, v) => t;');
     const googleStop = await startCaptureBridge(page, { ...inv, platform: 'google_meet', voiceAgentEnabled: true }, pipeline);
     try {
+      await page.evaluate(`document.body.insertAdjacentHTML('beforeend','<button id="chat-toggle" aria-label="Chat with everyone" data-panel-id="chat" aria-controls="chat-panel" aria-expanded="false" onclick="window.chatClicks=(window.chatClicks||0)+1">chat</button>');`);
+      await sleep(2200);
+      check('voice assistant does not auto-open chat while finding People', await page.evaluate('!window.chatClicks'));
       check('sibling count badge proves complete Google roster', await page.evaluate('window.__vexaRoomSnapshot().complete'));
       check('structural self excluded; human kept', await page.evaluate('JSON.stringify(window.__vexaRoomSnapshot().ids)===JSON.stringify(["human"])'));
       await page.evaluate('document.getElementById("count").textContent="3"');
@@ -200,6 +203,9 @@ async function main(): Promise<void> {
       check('opens only the linked People panel', await ensureMeetingPeoplePanel(page));
       check('linked in-call header proves count; waiting/name numbers do not', await page.evaluate('window.__vexaRoomSnapshot().complete'));
       check('already-open People panel is never toggled closed', await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===1'));
+      await page.evaluate(`const b=document.querySelector('button');b.setAttribute('aria-label','Open panel');b.querySelector('.google-symbols').textContent='\uE7EF';b.setAttribute('aria-expanded','false');document.getElementById('people-panel').hidden=true;`);
+      check('participant glyph selects People, never chat with everyone', await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===2 && !window.chatClicks'));
+
       await page.evaluate('document.getElementById("people-panel").hidden=true;document.querySelector("button").setAttribute("aria-expanded","false")');
       check('hidden panel cannot keep history available', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
       await page.evaluate(`document.getElementById('people-panel').hidden=false;document.querySelector('button').setAttribute('aria-expanded','true');
@@ -209,7 +215,7 @@ async function main(): Promise<void> {
       check('panel drift probe reports category without private text or raw numbers', panelProbe.includes('"textKind":"in-call"') && !/1234|Private Participant|VOXAI|"human"|"self"/.test(panelProbe));
 
       await page.evaluate('document.querySelector("button").removeAttribute("data-panel-id")');
-      check('invite/unlinked people action is never clicked', !await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===1'));
+      check('invite/unlinked people action is never clicked', !await ensureMeetingPeoplePanel(page) && await page.evaluate('window.peopleClicks===2 && !window.chatClicks'));
 
     } finally {
       await googleStop();
