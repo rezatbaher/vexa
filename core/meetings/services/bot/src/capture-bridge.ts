@@ -1,4 +1,4 @@
-import { ensureMeetingMicUnmuted } from './meeting-dom.js';
+import { ensureMeetingMicUnmuted, installLocalMediaTracker } from './meeting-dom.js';
 /**
  * Capture bridge (2b) — the browser-resident capture → pipeline pump + the speak path.
  *
@@ -162,6 +162,8 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   // join args win on conflict (later wins in Chromium arg parsing).
   const args = [...getAuthenticatedBrowserArgs(), ...getJoinBrowserArgs()];
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
+
+  await installLocalMediaTracker(context);
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
   await context.addInitScript(`window.__vexa_voice_agent_enabled = ${!!inv.voiceAgentEnabled};`);
@@ -414,6 +416,7 @@ export async function startCaptureBridge(
       w.__vexaGmeetSpeakers = w.__vexaGmeetSpeakers
         ?? w.VexaBrowserUtils.createGmeetSpeakers?.({
           selfName: botName, pollMs: 100,
+          isLocalTrack: (track: any) => w.__vexaIsLocalMediaTrack?.(track) === true,
           log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
           onSpeaking: (name: string, ended: boolean) => w.__vexaRoomActivity?.(name, ended),
         });
@@ -426,7 +429,9 @@ export async function startCaptureBridge(
           const counts = new Set<number>();
           for (const button of buttons) {
             const label = String(button.getAttribute('aria-label') || button.getAttribute('data-tooltip') || '');
-            if (!/people|participants|show everyone/i.test(label)) continue;
+            const icon = button.querySelector('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined');
+            const peopleIcon = /^(people|people_alt|group|groups|supervisor_account)$/.test(String(icon?.textContent || '').trim());
+            if (!/people|participants|show everyone/i.test(label) && !peopleIcon) continue;
             const numbers = (label + ' ' + String(button.textContent || '')).match(/\d{1,4}/g) || [];
             for (const number of numbers) counts.add(Number(number));
             // Meet can render the count as a sibling badge, outside the actual button.
@@ -448,11 +453,12 @@ export async function startCaptureBridge(
             (w as any).__vexaRoomProbeLogged = true;
             // Operational structure only: no participant names, IDs, text or credentials.
             w.logBot?.('[RoomPresence] ' + JSON.stringify({ countCandidates: counts.size, expectedCountObserved: counts.has(new Set(state.tiles.map((t: any) => t.id)).size), tiles: state.tiles.length,
-              selfMarkers: w.document.querySelectorAll('[data-self-name]').length,
+              selfMarkers: w.document.querySelectorAll('[data-self-name]').length, localTrackerReady: typeof w.__vexaIsLocalMediaTrack === 'function',
               // Only generic UI-control metadata and booleans; never names, IDs or
               // full DOM/text. This probe diagnoses provider markup drift safely.
               controls: (Array.from(w.document.querySelectorAll('[aria-label],[data-tooltip]')) as any[])
-                .filter(node => /^(people|participants|show everyone|everyone)(?:\s|$)/i.test(String(node.getAttribute('aria-label') || node.getAttribute('data-tooltip') || '')))
+                .filter(node => /people|participants|everyone/i.test(String(node.getAttribute('aria-label') || node.getAttribute('data-tooltip') || ''))
+                  || /^(people|people_alt|group|groups|supervisor_account)$/.test(String(node.querySelector('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined')?.textContent || '').trim()))
                 .slice(0, 12).map(node => {
                   const wrappers = []; let parent = node;
                   for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
@@ -464,6 +470,8 @@ export async function startCaptureBridge(
                   }
                   return { tag: node.tagName, attributes: Array.from(node.attributes).map((a: any) => a.name), wrappers };
                 }),
+              peopleIcons: (Array.from(w.document.querySelectorAll('button,[role="button"]')) as any[]).filter(button =>
+                /^(people|people_alt|group|groups|supervisor_account)$/.test(String(button.querySelector('.google-symbols,.google-material-icons,.material-icons,.material-symbols-outlined')?.textContent || '').trim())).length,
               localMarkers: (Array.from(w.document.querySelectorAll('*')) as any[]).slice(0, 3000).flatMap(node =>
                 Array.from(node.attributes).filter((a: any) => /self|local/i.test(a.name)).map((a: any) => ({
                   attribute: a.name, flag: /^(true|false)$/i.test(a.value) ? a.value : null,

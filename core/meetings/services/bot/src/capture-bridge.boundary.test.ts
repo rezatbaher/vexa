@@ -18,13 +18,14 @@
  * Run: npx tsx src/capture-bridge.boundary.test.ts
  */
 import { execSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchPersistentBrowser, type BrowserContext } from '@vexa/remote-browser';
 import { startCaptureBridge } from './capture-bridge.js';
-import { ensureMeetingMicUnmuted } from './meeting-dom.js';
+import { ensureMeetingMicUnmuted, installLocalMediaTracker } from './meeting-dom.js';
 import type { BotPipeline, HintCounters } from './pipeline.js';
 import type { Invocation } from './config.js';
 
@@ -62,11 +63,12 @@ async function main(): Promise<void> {
   let context: BrowserContext;
   let page;
   try {
-    ({ context, page } = await launchPersistentBrowser({ dataDir, args: ['--no-sandbox', '--mute-audio'], headless: true }));
+    ({ context, page } = await launchPersistentBrowser({ dataDir, args: ['--no-sandbox', '--mute-audio', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'], headless: true }));
   } catch (e) {
     console.log(`  ⚠️ SKIP — headless Chromium unavailable in this environment: ${(e as Error).message?.split('\n')[0]}`);
     process.exit(0);
   }
+  let fixtureServer: ReturnType<typeof createServer> | undefined;
   try {
     await context.addInitScript({ path: BUNDLE });
     const pageLogs: string[] = [];
@@ -129,10 +131,37 @@ async function main(): Promise<void> {
     await page.evaluate(`document.getElementById('mic').setAttribute('aria-label','Turn on microphone');document.getElementById('mic').onclick=()=>{window.micClicks++}`);
     check('unconfirmed microphone fails closed without toggling twice', !await ensureMeetingMicUnmuted(page, 'google_meet') && await page.evaluate('window.micClicks===2'));
 
-    // Real Google bridge and speaker scan with the count outside the button.
-    await page.setContent(`<div data-participant-id="self" data-self-name="VOXAI"><span class="notranslate">VOXAI</span></div>
-      <div data-participant-id="human"><span class="notranslate">Alice</span></div>
-      <div><button aria-label="Show everyone">people</button><span id="count">2</span></div><p>1234</p>`);
+    // Native capture provenance survives clones; remote device metadata proves nothing.
+    await installLocalMediaTracker(context);
+    fixtureServer = createServer((_req, res) => res.end('<!doctype html><html><body></body></html>'));
+    await new Promise<void>(resolve => fixtureServer!.listen(0, '127.0.0.1', resolve));
+    await page.goto(`http://127.0.0.1:${(fixtureServer.address() as any).port}`);
+    await page.evaluate('globalThis.__name = (t, v) => t;');
+    const nativeIdentity = await page.evaluate(async () => {
+      const w = globalThis as any;
+      const local = await w.navigator.mediaDevices.getUserMedia({ video: true });
+      const sender = new w.RTCPeerConnection({ iceServers: [] });
+      const receiver = new w.RTCPeerConnection({ iceServers: [] });
+      const received = new Promise<any>(resolve => { receiver.ontrack = (event: any) => resolve(event.track); });
+      sender.addTrack(local.getVideoTracks()[0], local);
+      await sender.setLocalDescription(await sender.createOffer());
+      await receiver.setRemoteDescription(sender.localDescription);
+      const remote = await received;
+      const localClone = local.getVideoTracks()[0].clone();
+      const remoteClone = remote.clone();
+      w.__fixtureLocal = new w.MediaStream([localClone]); w.__fixtureRemote = new w.MediaStream([remoteClone]);
+      w.__fixtureCapture = local;
+      w.__fixturePeers = [sender, receiver];
+      return { local: w.__vexaIsLocalMediaTrack(local.getVideoTracks()[0]),
+        localClone: w.__vexaIsLocalMediaTrack(localClone), remote: w.__vexaIsLocalMediaTrack(remote),
+        remoteClone: w.__vexaIsLocalMediaTrack(remoteClone) };
+    });
+    check('native capture and clone provenance excludes no remote tracks', nativeIdentity.local && nativeIdentity.localClone && !nativeIdentity.remote && !nativeIdentity.remoteClone, JSON.stringify(nativeIdentity));
+    // Both labels match the bot. Only the native captured track can identify self.
+    await page.setContent(`<div data-participant-id="self"><span class="notranslate">VOXAI</span><video id="local-video" muted autoplay></video></div>
+      <div data-participant-id="human"><span class="notranslate">VOXAI</span><video id="remote-video" muted autoplay></video></div>
+      <div><button><span class="google-symbols" aria-hidden="true">people</span></button><span id="count">2</span></div><p>1234</p>`);
+    await page.evaluate('document.getElementById("local-video").srcObject=window.__fixtureLocal;document.getElementById("remote-video").srcObject=window.__fixtureRemote');
     await page.addScriptTag({ path: BUNDLE });
     await page.evaluate('globalThis.__name = (t, v) => t;');
     const googleStop = await startCaptureBridge(page, { ...inv, platform: 'google_meet' }, pipeline);
@@ -149,10 +178,18 @@ async function main(): Promise<void> {
       check('no count cannot infer completeness from visible tiles', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
       await page.evaluate('document.querySelector("button").setAttribute("aria-label","Show everyone 2");document.querySelector("button").parentElement.insertAdjacentHTML("beforeend","<span>3</span>")');
       check('ambiguous count keeps roster incomplete', !await page.evaluate('window.__vexaRoomSnapshot().complete'));
-    } finally { await googleStop(); }
+      await page.evaluate('document.getElementById("remote-video").srcObject=window.__fixtureLocal');
+      check('ambiguous local media never excludes a human tile', await page.evaluate('window.__vexaRoomSnapshot().ids.length===2'));
+      await page.evaluate('document.getElementById("local-video").srcObject=null;document.getElementById("remote-video").srcObject=null');
+      check('matching display names never identify self', await page.evaluate('window.__vexaRoomSnapshot().ids.length===2'));
+    } finally {
+      await googleStop();
+      await page.evaluate('window.__fixturePeers.forEach(peer=>peer.close());window.__fixtureLocal.getTracks().forEach(track=>track.stop());window.__fixtureCapture.getTracks().forEach(track=>track.stop())');
+    }
 
   } finally {
     await context.close().catch(() => { /* best-effort */ });
+    if (fixtureServer) await new Promise<void>(resolve => fixtureServer!.close(() => resolve()));
     rmSync(dataDir, { recursive: true, force: true });
   }
 

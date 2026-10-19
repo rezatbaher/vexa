@@ -28,8 +28,10 @@
  */
 
 export interface GmeetSpeakersOptions {
-  /** Local participant's display name (bot name / data-self-name). Excluded from candidates. */
+  /** Legacy display label; never sufficient evidence to exclude a participant. */
   selfName?: string;
+  /** Trusted document-start capture provenance; never infer this from track labels/settings. */
+  isLocalTrack?: (track: MediaStreamTrack) => boolean;
   /** Debounced speaking state change for a NON-self named tile.
    *  isEnd=false → started speaking; isEnd=true → stopped. */
   onSpeaking?: (name: string, isEnd: boolean) => void;
@@ -129,7 +131,20 @@ export function createGmeetSpeakers(opts: GmeetSpeakersOptions = {}): GmeetSpeak
   function selfParticipantId(): string | null {
     const marker = document.querySelector('[data-self-name]');
     const tile = marker?.closest('[data-participant-id]') as HTMLElement | null;
-    return tile?.getAttribute('data-participant-id') || null;
+    if (tile) return tile.getAttribute('data-participant-id') || null;
+    // Current Meet can omit data-self-name. Only tracks observed at local capture
+    // (or cloned from those tracks) prove self. Some Chromium versions give remote
+    // tracks a deviceId too; settings and labels are NOT evidence of local origin.
+    // A unique tile is required; ambiguous previews exclude no participant.
+    const localIds = new Set<string>();
+    for (const media of Array.from(document.querySelectorAll('video,audio'))) {
+      const stream = (media as HTMLMediaElement).srcObject;
+      if (!(stream instanceof MediaStream)) continue;
+      if (!stream.getTracks().some(track => { try { return opts.isLocalTrack?.(track) === true; } catch { return false; } })) continue;
+      const id = media.closest('[data-participant-id]')?.getAttribute('data-participant-id');
+      if (id) localIds.add(id);
+    }
+    return localIds.size === 1 ? [...localIds][0] : null;
   }
 
   // Self/host detection is PURELY STRUCTURAL — Meet's data-self-name marker, never

@@ -1,5 +1,5 @@
 /** Bounded, state-checked microphone control; never click a settings button or toggle twice. */
-import type { Page } from '@vexa/remote-browser';
+import type { BrowserContext, Page } from '@vexa/remote-browser';
 
 export async function ensureMeetingMicUnmuted(page: Page, platform: string): Promise<boolean> {
   return page.evaluate(async ({ platform }) => {
@@ -26,4 +26,38 @@ export async function ensureMeetingMicUnmuted(page: Page, platform: string): Pro
     }
     return false;
   }, { platform }).catch(() => false);
+}
+
+/** Install before navigation. Only captured tracks and their clones prove local origin. */
+export async function installLocalMediaTracker(context: BrowserContext): Promise<void> {
+  // String injection keeps document-start code independent of transpiler helpers.
+  await context.addInitScript(`(() => {
+    if (window.__vexaIsLocalMediaTrack) return;
+    const devices = navigator.mediaDevices;
+    const proto = window.MediaStreamTrack && window.MediaStreamTrack.prototype;
+    if (!devices || !devices.getUserMedia || !proto || !proto.clone) return;
+    const capture = devices.getUserMedia;
+    const clone = proto.clone;
+    const local = new WeakSet();
+    const captureDescriptor = Object.getOwnPropertyDescriptor(devices, 'getUserMedia');
+    const cloneDescriptor = Object.getOwnPropertyDescriptor(proto, 'clone');
+    try {
+      Object.defineProperty(devices, 'getUserMedia', { configurable: true, writable: true,
+        value: async function (...args) {
+          const stream = await capture.apply(this, args);
+          stream.getTracks().forEach(track => local.add(track));
+          return stream;
+        } });
+      Object.defineProperty(proto, 'clone', { ...cloneDescriptor, value: function (...args) {
+        const result = clone.apply(this, args);
+        if (local.has(this)) local.add(result);
+        return result;
+      } });
+      window.__vexaIsLocalMediaTrack = track => local.has(track);
+    } catch {
+      if (captureDescriptor) Object.defineProperty(devices, 'getUserMedia', captureDescriptor);
+      else delete devices.getUserMedia;
+      if (cloneDescriptor) Object.defineProperty(proto, 'clone', cloneDescriptor);
+    }
+  })();`);
 }
