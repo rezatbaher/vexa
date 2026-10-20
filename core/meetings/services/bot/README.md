@@ -101,3 +101,8 @@ On abnormal closure, confirmed prefixes are persisted under the reserved opaque 
 `:utterance:incomplete`; unconfirmed tails are excluded. Consumers retain these words for notes
 while suppressing live question/followup handling for that suffix. Normal endpoints never emit
 this salvage copy. No transcript schema field or seal changes are needed.
+
+The bot handshake uses `same_output_threshold: 8` for server confirmation. A threshold of2
+reproduced premature prefix cuts/re-decoded words in actual synthetic STT. Local early endpoints
+still require only two stable tail decodes plus speech silence, independently of server confirmation.
+This is connection-local; it changes no shared WhisperLive capacity, configuration or phone client.

@@ -55,6 +55,7 @@ for (const url of ['https://host', 'ws://user:secret@host', 'ws://host?token=sec
       ws.ready();
       const hello = JSON.parse(ws.sent[0] as string);
       assert.equal(hello.audio_format, 'float32'); assert.equal(hello.use_vad, true);
+      assert.equal(hello.same_output_threshold, 8, 'Server prefix cuts require stronger stability than local endpoints');
       assert(ws.sent[1] instanceof Float32Array);
       for (let n = 0; n < 2; n++) ws.frame({ language: 'en', segments: [{ start: 0, end: 1, text: 'Vox AI, summarize the decisions.', completed: false }] });
     }

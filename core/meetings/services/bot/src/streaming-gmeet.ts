@@ -189,7 +189,8 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
       if (s.ended || stopped) { socket.close(); return; }
       socket.send(JSON.stringify({ uid: s.id, language: opts.language && /^[a-z]{2,3}$/.test(opts.language) ? opts.language : null, task: 'transcribe',
         model: opts.model ?? 'large-v3-turbo', use_vad: true, audio_format: 'float32',
-        same_output_threshold: 2, send_last_n_segments: 30 }));
+        // Avoid irreversible mid-sentence cuts; local silence/stable-tail endpointing stays fast.
+        same_output_threshold: 8, send_last_n_segments: 30 }));
     });
     socket.addEventListener('message', e => { try { receive(s, e.data); } catch { fail(s, 'response processing failed'); } });
     socket.addEventListener('error', () => fail(s, 'connection failed'));

@@ -16,6 +16,7 @@ server.on('connection', socket => {
     if (!uid) {
       assert(!binary); const hello = JSON.parse(raw.toString()); uid = hello.uid;
       assert.equal(hello.audio_format, 'float32'); assert.equal(hello.model, 'large-v3-turbo');
+      assert.equal(hello.same_output_threshold, 8);
       socket.send(JSON.stringify({ uid, message: 'SERVER_READY' }));
     } else if (binary) {
       if (binaryPcm === 0) {
