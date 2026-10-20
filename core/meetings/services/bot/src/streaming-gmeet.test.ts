@@ -21,10 +21,10 @@ class FakeSocket {
 const inv = { platform: 'google_meet', transcribeEnabled: true, language: 'en' } as Invocation;
 const pcm = (seconds = 1) => new Float32Array(seconds * 16000).fill(.1);
 const pause = () => new Promise(resolve => setTimeout(resolve, 120));
-function fixture(earlyFinal = true) {
+function fixture(earlyFinal = true, language: string | null = 'en') {
   let clock = 1792485000000;
   const sockets: FakeSocket[] = [], results: TranscriptSegment[] = [], faults: any[] = [];
-  const pipe = createBotPipeline(inv, { publish: async s => { results.push(s); } }, {
+  const pipe = createBotPipeline({ ...inv, language: language ?? undefined } as Invocation, { publish: async s => { results.push(s); } }, {
     transcribe: async () => { throw Error('batch path must not run'); },
     streaming: { url: 'ws://whisper.invalid:9090', model: 'large-v3-turbo', earlyFinal,
       now: () => clock, socket: () => { const ws = new FakeSocket(); sockets.push(ws); return ws; } },
@@ -235,4 +235,74 @@ for (const reason of ['disconnect', 'retirement', 'idle']) {
     assert(f.sockets[0].closed); assert(f.faults.some(e => e.detail.includes('buffer exceeded')));
   } finally { await f.clean(); }
 }
-console.log('PASS streaming Meet: 10 channels, handshake, early endpoints, continuing speech, late-final dedup, rotation, capacity faults, bounded buffering');
+// Meet's glow lags the audio: an unnamed lead-in adopts the first glow name (one socket, one
+// utterance, named), so a wake phrase is never split from its question.
+{
+  const f = fixture();
+  try {
+    f.pipe.feedAudio(0, undefined, pcm(.5), f.now()); const ws = f.sockets[0]; ws.ready();
+    await f.advance(500); f.pipe.feedAudio(0, 'Alice', pcm(.5), f.now());
+    assert.equal(f.sockets.length, 1, 'glow catching up must not rotate the stream');
+    for (let n = 0; n < 2; n++) ws.frame({ segments: [{ start: 0, end: 1, text: 'Hey agent, what time is it?', completed: false }] });
+    await f.advance(500);
+    const done = f.results.filter(s => s.completed);
+    assert.equal(done.length, 1);
+    assert.equal(done[0].speaker, 'Alice'); assert.equal(done[0].text, 'Hey agent, what time is it?');
+    assert.equal(f.faults.length, 0);
+  } finally { await f.clean(); }
+}
+// A long unnamed stretch is not a lead-in: a name lit later still rotates.
+{
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, undefined, pcm(1), f.now()); f.sockets[0].ready();
+    await f.advance(3500); f.pipe.feedAudio(0, 'Alice', pcm(.2), f.now());
+    assert.equal(f.sockets.length, 2, 'a named voice after a long pause is not the lead-in');
+  } finally { await f.clean(); }
+}
+// ...but a long unnamed stretch of CONTINUOUS speech is still one person: adopt.
+{
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, undefined, pcm(1), f.now()); f.sockets[0].ready();
+    for (let i = 0; i < 4; i++) { await f.advance(1000); f.pipe.feedAudio(0, undefined, pcm(1), f.now()); }
+    f.pipe.feedAudio(0, 'Alice', pcm(.2), f.now());
+    assert.equal(f.sockets.length, 1);
+  } finally { await f.clean(); }
+}
+// A bare wake phrase waits for the request that follows a breath instead of ending the turn.
+{
+  const f = fixture();
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(), f.now()); const ws = f.sockets[0]; ws.ready();
+    for (let n = 0; n < 2; n++) ws.frame({ segments: [{ start: 0, end: 1, text: 'Hey agent,', completed: false }] });
+    await f.advance(700);
+    assert.equal(f.results.filter(s => s.completed).length, 0, 'a bare call must not end the utterance at 450ms');
+    f.pipe.feedAudio(0, 'Alice', pcm(1), f.now());
+    for (let n = 0; n < 2; n++) ws.frame({ segments: [{ start: 0, end: 2, text: 'Hey agent, what time is it?', completed: false }] });
+    await f.advance(500);
+    const done = f.results.filter(s => s.completed);
+    assert.equal(done.length, 1); assert.equal(done[0].text, 'Hey agent, what time is it?');
+  } finally { await f.clean(); }
+}
+// With no configured language, a confident detection is reused on the speaker's next socket.
+{
+  const f = fixture(true, null);
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(), f.now()); const a = f.sockets[0]; a.ready();
+    assert.equal(JSON.parse(a.sent[0] as string).language, null);
+    a.frame({ language: 'en', language_prob: .97 });
+    for (let n = 0; n < 2; n++) a.frame({ segments: [{ start: 0, end: 1, text: 'Hey agent, what time is it?', completed: false }] });
+    await f.advance(500); assert(a.closed);
+    f.pipe.feedAudio(0, 'Alice', pcm(), f.now()); const b = f.sockets[1]; b.ready();
+    assert.equal(JSON.parse(b.sent[0] as string).language, 'en');
+    // A weak detection is not reused.
+    f.pipe.feedAudio(1, 'Bob', pcm(), f.now()); const c = f.sockets[2]; c.ready();
+    c.frame({ language: 'pt', language_prob: .53 });
+    for (let n = 0; n < 2; n++) c.frame({ segments: [{ start: 0, end: 1, text: 'Thanks everyone, see you next week.', completed: false }] });
+    await f.advance(500);
+    f.pipe.feedAudio(1, 'Bob', pcm(), f.now()); const d = f.sockets[3]; d.ready();
+    assert.equal(JSON.parse(d.sent[0] as string).language, null);
+  } finally { await f.clean(); }
+}
+console.log('PASS streaming Meet: glow lead-in adoption, bare-call hold, sticky language, 10 channels, handshake, early endpoints, continuing speech, late-final dedup, rotation, capacity faults, bounded buffering');

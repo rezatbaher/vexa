@@ -27,7 +27,7 @@ export interface StreamingOptions {
 }
 interface Candidate { start: number; end: number; text: string; repeats: number; at: number }
 interface Stream {
-  id: string; channel: number; name: string; origin: number; cursor: number;
+  id: string; channel: number; name: string; unnamed: boolean; origin: number; cursor: number;
   socket: Socket; ready: boolean; ended: boolean; lastFeed: number; lastSpeech: number; lastSpeechOffset: number;
   capture: { a: number; b: number; start: number; end: number }[];
   queued: Float32Array[]; queuedSamples: number; candidate?: Candidate; language?: string;
@@ -37,6 +37,18 @@ interface Stream {
 const SR = 16000;
 const MAX_QUEUE = 8 * SR;
 const INCOMPLETE = /\b(and|or|the|to|with|because|of|for|a|an|at|in|that|if|but|is)$/i;
+/** Meet lights a speaker's tile a moment AFTER their audio starts, so the first words of almost
+ * every utterance arrive with no glow name. A stream opened unnamed adopts the first name that
+ * lights within this window instead of rotating: rotating split "hey agent" from its question and
+ * left the lead-in to time out on its own socket. A later, different name still rotates. */
+const ADOPT_UNNAMED_MS = 3000;
+/** ...or at any age while the voice on the track has not paused: continuous speech is one person. */
+const ADOPT_UNNAMED_PAUSE_MS = 1500;
+/** A per-utterance socket re-detects language from a second or two of audio, which is how a short
+ * English wake phrase came back as Portuguese. A confident detection is reused for that speaker
+ * (and channel) on later sockets when the meeting has no configured language. */
+const STICKY_LANGUAGE_PROB = 0.8;
+const LANGUAGE = /^[a-z]{2,3}$/;
 
 /** Last energetic 20ms frame. Silence padding never extends the speech clock. */
 export function speechEnd(pcm: Float32Array): number {
@@ -58,6 +70,16 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
   const streams = new Map<number, Stream>();
   const retiring = new Set<Stream>();
   const cooldown = new Map<number, number>();
+  const speakerLanguage = new Map<string, string>();
+  const channelLanguage = new Map<number, string>();
+  const remember = <K>(map: Map<K, string>, key: K, value: string) => {
+    map.delete(key); map.set(key, value);
+    if (map.size > 64) map.delete(map.keys().next().value!);
+  };
+  const languageFor = (s: Stream): string | null => {
+    if (opts.language && LANGUAGE.test(opts.language)) return opts.language;
+    return (!s.unnamed && speakerLanguage.get(s.name)) || channelLanguage.get(s.channel) || null;
+  };
   const publications = new Set<Promise<void>>();
   let stopped = false;
   let stopping = false;
@@ -150,7 +172,13 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
       for (const pcm of queued) send(s, pcm);
       return;
     }
-    if (typeof frame.language === 'string' && /^[a-z]{2,3}$/.test(frame.language)) s.language = frame.language;
+    if (typeof frame.language === 'string' && LANGUAGE.test(frame.language)) {
+      s.language = frame.language;
+      if (!opts.language && Number(frame.language_prob) >= STICKY_LANGUAGE_PROB) {
+        if (!s.unnamed) remember(speakerLanguage, s.name, frame.language);
+        remember(channelLanguage, s.channel, frame.language);
+      }
+    }
     if (!Array.isArray(frame.segments)) return;
     let tail: Candidate | undefined;
     for (const seg of frame.segments.slice(-100)) {
@@ -177,17 +205,17 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
     const draft = assembled(s, true);
     if (draft) publish(s, draft, false);
   };
-  const open = (channel: number, name: string, origin: number): Stream | undefined => {
+  const open = (channel: number, name: string | undefined, origin: number): Stream | undefined => {
     if (streams.size + retiring.size >= 32) { fault('active channel limit'); return; }
     let socket: Socket;
     try { socket = makeSocket(opts.url); } catch { fault('connection failed'); cooldown.set(channel, now() + 3000); return; }
-    const s: Stream = { id: randomUUID(), channel, name, origin, cursor: origin, socket, ready: false,
+    const s: Stream = { id: randomUUID(), channel, name: name ?? 'Speaker', unnamed: !name, origin, cursor: origin, socket, ready: false,
       ended: false, lastFeed: now(), lastSpeech: origin, lastSpeechOffset: origin, capture: [], queued: [], queuedSamples: 0,
       language: opts.language, pieces: new Map(), finals: new Map(), confirmedUntil: origin, publishing: Promise.resolve() };
     streams.set(channel, s);
     socket.addEventListener('open', () => {
       if (s.ended || stopped) { socket.close(); return; }
-      socket.send(JSON.stringify({ uid: s.id, language: opts.language && /^[a-z]{2,3}$/.test(opts.language) ? opts.language : null, task: 'transcribe',
+      socket.send(JSON.stringify({ uid: s.id, language: languageFor(s), task: 'transcribe',
         model: opts.model ?? 'large-v3-turbo', use_vad: true, audio_format: 'float32',
         // Avoid irreversible mid-sentence cuts; local silence/stable-tail endpointing stays fast.
         same_output_threshold: 8, send_last_n_segments: 30 }));
@@ -212,7 +240,11 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
       const c = s.candidate;
       // Require two matching decodes, a quiet caller, a fresh decode, and coverage of the
       // latest speech. A later audio frame invalidates the endpoint until decoded too.
-      const hold = c && INCOMPLETE.test(c.text.replace(/[,.!?]+$/, '')) ? 1100 : 450;
+      // A bare call ("Hey agent,") is usually followed by the request after a breath; ending the
+      // utterance there separates the wake phrase from its question. Short or comma-ended text waits
+      // as long as an incomplete clause does.
+      const bare = c && (/,\s*$/.test(c.text) || c.text.trim().split(/\s+/).length <= 3);
+      const hold = c && (bare || INCOMPLETE.test(c.text.replace(/[,.!?]+$/, ''))) ? 1100 : 450;
       if (opts.earlyFinal !== false && c && c.repeats >= 2 && at - s.lastSpeech >= hold &&
           at - c.at < 2000 && s.origin + c.end * 1000 >= s.lastSpeechOffset - 160 &&
           at - s.lastFeed >= 450) {
@@ -251,12 +283,19 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
       if ((cooldown.get(channel) ?? 0) > now()) return;
       const duration = pcm.length / SR * 1000;
       let s = streams.get(channel);
-      if (s && glowName && s.name !== glowName) { retire(s); s = undefined; }
-      if (!s) s = open(channel, glowName || 'Speaker', tsMs - duration);
+      if (s && glowName && s.name !== glowName) {
+        if (s.unnamed && (tsMs - s.origin <= ADOPT_UNNAMED_MS || tsMs - duration - s.lastSpeech <= ADOPT_UNNAMED_PAUSE_MS)) {
+          // Same track, glow caught up: the lead-in is this speaker's. Name the whole utterance.
+          s.name = glowName; s.unnamed = false;
+          const known = !opts.language && speakerLanguage.get(glowName);
+          if (known) remember(channelLanguage, channel, known);
+        } else { retire(s); s = undefined; }
+      }
+      if (!s) s = open(channel, glowName, tsMs - duration);
       if (!s) return;
       // Audio frames are end-stamped. Fill omitted silent frames, but never create huge queues.
       const gap = Math.max(0, tsMs - duration - s.cursor);
-      if (gap > 8000) { retire(s); s = open(channel, glowName || 'Speaker', tsMs - duration); if (!s) return; }
+      if (gap > 8000) { retire(s); s = open(channel, glowName, tsMs - duration); if (!s) return; }
       else if (gap >= 20) { send(s, new Float32Array(Math.round(gap / 1000 * SR))); s.cursor += gap; }
       if (s.ended) return;
       if (s.capture.length >= 4096) { fail(s, 'capture timing buffer limit'); return; }
