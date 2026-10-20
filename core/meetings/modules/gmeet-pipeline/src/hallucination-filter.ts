@@ -40,7 +40,7 @@ function loadPhrases(): Set<string> {
 /**
  * Returns true if the text is a hallucination and should be dropped.
  */
-export function isHallucination(text: string): boolean {
+export function isHallucination(text: string, options: { allowShort?: boolean } = {}): boolean {
   if (!text?.trim()) return true;
 
   const trimmed = text.trim();
@@ -56,7 +56,7 @@ export function isHallucination(text: string): boolean {
 
   // Too short (single word < 10 chars)
   const words = trimmed.split(/\s+/);
-  if (words.length <= 1 && trimmed.length < 10) return true;
+  if (!options.allowShort && words.length <= 1 && trimmed.length < 10) return true;
 
   // Repetition loop: same 3-6 word phrase repeated 3+ times
   if (words.length >= 9) {

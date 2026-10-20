@@ -31,6 +31,7 @@ interface Stream {
   socket: Socket; ready: boolean; ended: boolean; lastFeed: number; lastSpeech: number; lastSpeechOffset: number;
   capture: { a: number; b: number; start: number; end: number }[];
   queued: Float32Array[]; queuedSamples: number; candidate?: Candidate; language?: string;
+  pieces: Map<string, Candidate>; lastDraft?: string;
   finals: Map<string, string>; confirmedUntil: number; retireUntil?: number; publishing: Promise<void>;
 }
 const SR = 16000;
@@ -73,7 +74,12 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
     // Node's WebSocket sends this typed array as Float32 little-endian PCM, not WAV.
     s.socket.send(pcm);
   };
-  const close = (s: Stream) => {
+  const close = (s: Stream, complete = false) => {
+    // Retain confirmed speech on failure without asking a truncated question.
+    if (!s.ended && !complete) {
+      const prefix = assembled(s, false);
+      if (prefix) publish(s, prefix, true, true);
+    }
     if (s.ended) return;
     s.ended = true;
     if (streams.get(s.channel) === s) streams.delete(s.channel);
@@ -92,7 +98,15 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
     if (!streams.has(s.channel) || streams.get(s.channel) === s) cooldown.set(s.channel, now() + 3000);
     close(s);
   }
-  const publish = (s: Stream, c: Candidate, completed: boolean) => {
+  const assembled = (s: Stream, includeTail: boolean): Candidate | undefined => {
+    const parts = [...s.pieces.values()];
+    if (includeTail && s.candidate) parts.push(s.candidate);
+    parts.sort((a, b) => a.start - b.start);
+    if (!parts.length) return;
+    return { start: parts[0].start, end: Math.max(...parts.map(c => c.end)),
+      text: parts.map(c => c.text).join(' '), repeats: 0, at: now() };
+  };
+  const publish = (s: Stream, c: Candidate, completed: boolean, incomplete = false) => {
     const a = s.origin + c.start * 1000, b = s.origin + c.end * 1000;
     // Decoder offsets include synthetic silence and delayed frames. Only the producer's
     // original capture timestamps can grant attendance access. Whole-frame bounds are
@@ -101,9 +115,11 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
     if (!frames.length) return;
     const start = Math.min(...frames.map(f => f.start));
     const end = Math.max(...frames.map(f => f.end));
-    if (end <= start || isHallucination(c.text)) return;
+    if (end <= start || isHallucination(c.text, { allowShort: true })) return;
+    if (!completed && s.lastDraft === c.text) return;
+    if (!completed) s.lastDraft = c.text;
     const seg: TranscriptSegment = {
-      segment_id: `${s.id}:${c.start.toFixed(3)}`, speaker: s.name,
+      segment_id: `${s.id}:utterance${incomplete ? ":incomplete" : ""}`, speaker: s.name,
       speaker_key: `wl:${s.id}`, text: c.text, start: start / 1000, end: end / 1000,
       absolute_start_time: new Date(start).toISOString(), absolute_end_time: new Date(end).toISOString(),
       completed, language: s.language, words: [],
@@ -140,16 +156,26 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
     for (const seg of frame.segments.slice(-100)) {
       const start = Number(seg.start), end = Number(seg.end), text = String(seg.text ?? '').trim();
       if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || !text || text.length > 12000 || s.origin + end * 1000 > s.cursor + 300) continue;
+      if (isHallucination(text, { allowShort: true })) {
+        s.pieces.delete(start.toFixed(3));
+        if (seg.completed === true) s.confirmedUntil = Math.max(s.confirmedUntil, s.origin + end * 1000);
+        continue;
+      }
       const old = s.candidate;
       const c: Candidate = { start, end, text, at: now(),
         repeats: old && old.text === text && Math.abs(old.start - start) < .02 ? old.repeats + 1 : 1 };
       if (seg.completed === true) {
-        publish(s, c, true);
+        s.pieces.set(start.toFixed(3), c);
+        if (s.pieces.size > 2048) { fail(s, 'utterance text buffer limit'); return; }
         s.confirmedUntil = Math.max(s.confirmedUntil, s.origin + end * 1000);
       }
-      else { tail = c; publish(s, c, false); }
+      else { tail = c; }
     }
-    s.candidate = tail;
+    // Whisper confirms prefixes while the caller is still speaking. Keep those words,
+    // then publish ONE completed utterance only at an endpoint; wake words may span prefixes.
+    s.candidate = tail && s.origin + tail.end * 1000 > s.confirmedUntil ? tail : undefined;
+    const draft = assembled(s, true);
+    if (draft) publish(s, draft, false);
   };
   const open = (channel: number, name: string, origin: number): Stream | undefined => {
     if (streams.size + retiring.size >= 32) { fault('active channel limit'); return; }
@@ -157,7 +183,7 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
     try { socket = makeSocket(opts.url); } catch { fault('connection failed'); cooldown.set(channel, now() + 3000); return; }
     const s: Stream = { id: randomUUID(), channel, name, origin, cursor: origin, socket, ready: false,
       ended: false, lastFeed: now(), lastSpeech: origin, lastSpeechOffset: origin, capture: [], queued: [], queuedSamples: 0,
-      language: opts.language, finals: new Map(), confirmedUntil: origin, publishing: Promise.resolve() };
+      language: opts.language, pieces: new Map(), finals: new Map(), confirmedUntil: origin, publishing: Promise.resolve() };
     streams.set(channel, s);
     socket.addEventListener('open', () => {
       if (s.ended || stopped) { socket.close(); return; }
@@ -177,7 +203,11 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
       if (s.retireUntil && at >= s.retireUntil) {
         fault('final transcript timeout'); close(s); continue;
       }
-      if (at - s.lastFeed >= 450 && s.confirmedUntil >= s.lastSpeechOffset - 160 && s.confirmedUntil > s.origin) { close(s); continue; }
+      if (at - s.lastFeed >= 450 && !s.candidate && s.confirmedUntil >= s.lastSpeechOffset - 160 && s.confirmedUntil > s.origin) {
+        const utterance = assembled(s, false);
+        if (utterance) publish(s, utterance, true);
+        close(s, true); continue;
+      }
       const c = s.candidate;
       // Require two matching decodes, a quiet caller, a fresh decode, and coverage of the
       // latest speech. A later audio frame invalidates the endpoint until decoded too.
@@ -185,11 +215,12 @@ export function createStreamingGmeet(sink: TranscriptSink, opts: StreamingOption
       if (opts.earlyFinal !== false && c && c.repeats >= 2 && at - s.lastSpeech >= hold &&
           at - c.at < 2000 && s.origin + c.end * 1000 >= s.lastSpeechOffset - 160 &&
           at - s.lastFeed >= 450) {
-        publish(s, c, true);
-        close(s); // New audio gets a new segment/socket; delayed server finals cannot duplicate a reply.
+        const utterance = assembled(s, true);
+        if (utterance) publish(s, utterance, true);
+        close(s, true); // New audio gets a new segment/socket; delayed server finals cannot duplicate a reply.
         continue;
       }
-      if (at - s.lastFeed > 15000) { close(s); continue; }
+      if (at - s.lastFeed > 15000) { fault('utterance finalization timeout'); close(s); continue; }
       // Capture omits silent chunks. Restore silence at real-time pace, leaving 500ms
       // for a delayed AudioWorklet frame so silence cannot run ahead of captured speech.
       if (at - s.lastFeed > 600) {

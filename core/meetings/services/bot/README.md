@@ -91,3 +91,13 @@ binary `END_OF_AUDIO`, so draining precedes that marker. Retired failures never 
 successor. No PCM or transcript content is logged. `streaming-gmeet.test.ts` covers the real pipeline
 selection with10 fake channels; `streaming-websocket.test.ts` verifies actual native WebSocket JSON
 and binary transport against a local protocol fixture. These do not establish live Meet latency.
+
+Streaming server-confirmed prefixes are accumulated into one utterance. Draft and final share its
+identity; only an endpoint publishes completed text. This preserves wake questions split across
+server segments and avoids replying to a fragment. The streaming filter retains short prefixes
+while the batch short-word heuristic remains unchanged; phrase-list and repetition guards remain.
+
+On abnormal closure, confirmed prefixes are persisted under the reserved opaque ID suffix
+`:utterance:incomplete`; unconfirmed tails are excluded. Consumers retain these words for notes
+while suppressing live question/followup handling for that suffix. Normal endpoints never emit
+this salvage copy. No transcript schema field or seal changes are needed.

@@ -3,6 +3,7 @@ import { createBotPipeline } from './pipeline.js';
 import { whisperStreamingFromEnv } from './config.js';
 import type { Invocation } from './config.js';
 import type { TranscriptSegment } from './contracts.js';
+import { isHallucination } from '@vexa/gmeet-pipeline';
 import { speechEnd } from './streaming-gmeet.js';
 
 class FakeSocket {
@@ -94,7 +95,7 @@ for (const url of ['https://host', 'ws://user:secret@host', 'ws://host?token=sec
     a.frame({ segments: [{ start: 0, end: 1, text: 'Alice agreed to the proposal.', completed: true }] });
     b.frame({ segments: [{ start: 0, end: .2, text: 'Bob will review the proposal.', completed: true }] });
     await f.advance(500);
-    assert.deepEqual(f.results.filter(s => s.completed).map(s => s.speaker), ['Alice', 'Bob']);
+    assert.deepEqual(f.results.filter(s => s.completed).sort((a, b) => a.start - b.start).map(s => s.speaker), ['Alice', 'Bob']);
     assert(a.closed && b.closed);
   } finally { await f.clean(); }
 }
@@ -123,13 +124,96 @@ for (const url of ['https://host', 'ws://user:secret@host', 'ws://host?token=sec
     const delayedStart = samples / 16000;
     f.pipe.feedAudio(0, 'Alice', pcm(.256), firstEnd + 256);
     ws.frame({ segments: [{ start: delayedStart, end: delayedStart + .256, text: 'Speech captured before the attendee joined.', completed: true }] });
-    await pause();
+    await f.advance(500);
     const result = f.results.find(s => s.completed)!;
     assert(result);
     assert.equal(Date.parse(result.absolute_start_time!), firstEnd);
     assert.equal(Date.parse(result.absolute_end_time!), firstEnd + 256);
     const laterJoin = firstEnd + 1000;
     assert(result.start * 1000 < laterJoin, 'An attendance span starting later must exclude this entire segment');
+  } finally { await f.clean(); }
+}
+// Confirmed Whisper prefixes do not trigger a truncated question or lose its wake word.
+{
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(.2), f.now()); const ws = f.sockets[0]; ws.ready();
+    ws.frame({ segments: [{ start: 0, end: .2, text: 'Vox AI,', completed: true }] });
+    await pause(); assert.equal(f.results.filter(s => s.completed).length, 0);
+    await f.advance(400); f.pipe.feedAudio(0, 'Alice', pcm(.4), f.now());
+    ws.frame({ segments: [
+      { start: 0, end: .2, text: 'Vox AI,', completed: true },
+      { start: .2, end: .6, text: 'summarize our decisions.', completed: true },
+    ] });
+    await f.advance(500);
+    const final = f.results.filter(s => s.completed);
+    assert.equal(final.length, 1); assert.equal(final[0].text, 'Vox AI, summarize our decisions.');
+    assert.equal(new Set(f.results.map(s => s.segment_id)).size, 1, 'Draft and final share utterance identity');
+  } finally { await f.clean(); }
+}
+// Streaming retains legitimate short replies and prefixes; batch keeps its original heuristic.
+assert(isHallucination('Approved'));
+assert(!isHallucination('Approved', { allowShort: true }));
+assert(isHallucination('', { allowShort: true }));
+assert(isHallucination('Thanks for watching.', { allowShort: true }));
+for (const text of ['The', 'Yes', 'No', 'Approved']) {
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(.2), f.now()); const ws = f.sockets[0]; ws.ready();
+    ws.frame({ segments: [{ start: 0, end: .2, text, completed: true }] });
+    await f.advance(500);
+    assert.equal(f.results.find(s => s.completed)?.text, text);
+  } finally { await f.clean(); }
+}
+{
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(.2), f.now()); const ws = f.sockets[0]; ws.ready();
+    ws.frame({ segments: [{ start: 0, end: .2, text: 'The', completed: true }] });
+    await f.advance(400); f.pipe.feedAudio(0, 'Alice', pcm(.4), f.now());
+    ws.frame({ segments: [
+      { start: 0, end: .2, text: 'The', completed: true },
+      { start: .2, end: .6, text: 'delivery is confirmed.', completed: true },
+    ] });
+    await f.advance(500);
+    assert.equal(f.results.find(s => s.completed)?.text, 'The delivery is confirmed.');
+  } finally { await f.clean(); }
+}
+// A known hallucination remains excluded even when a clean prefix precedes it.
+{
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(), f.now()); const ws = f.sockets[0]; ws.ready();
+    ws.frame({ segments: [
+      { start: 0, end: .5, text: 'The launch date is Friday.', completed: true },
+      { start: .5, end: 1, text: 'Thanks for watching.', completed: true },
+    ] });
+    await f.advance(500);
+    assert.equal(f.results.find(s => s.completed)?.text, 'The launch date is Friday.');
+    assert(!f.results.some(s => s.text.includes('watching')));
+  } finally { await f.clean(); }
+}
+// Abnormal closure preserves confirmed words only, under a non-conversational identity.
+for (const reason of ['disconnect', 'retirement', 'idle']) {
+  const f = fixture(false);
+  try {
+    f.pipe.feedAudio(0, 'Alice', pcm(), f.now()); const ws = f.sockets[0]; ws.ready();
+    ws.frame({ segments: [
+      { start: 0, end: .5, text: 'Vox AI, the launch date is Friday.', completed: true },
+      { start: .5, end: 1, text: 'and we will', completed: false },
+    ] });
+    if (reason === 'disconnect') ws.emit('error');
+    else if (reason === 'retirement') {
+      await f.advance(200); f.pipe.feedAudio(0, 'Bob', pcm(.2), f.now());
+      await f.advance(8100);
+    } else await f.advance(15100);
+    await pause();
+    const confirmed = f.results.filter(s => s.completed);
+    assert.equal(confirmed.length, 1, reason);
+    assert.equal(confirmed[0].text, 'Vox AI, the launch date is Friday.');
+    assert(confirmed[0].segment_id.endsWith(':utterance:incomplete'));
+    assert(!confirmed[0].text.includes('and we will'));
+    assert(ws.closed);
   } finally { await f.clean(); }
 }
 // WAIT is attributable, the failed socket closes, cooldown prevents reconnection storms.
