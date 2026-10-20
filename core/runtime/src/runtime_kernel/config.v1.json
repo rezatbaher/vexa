@@ -330,6 +330,33 @@
    "default": "(unset - signed organization meeting delivery unavailable)",
    "description": "Infrastructure-owned private meeting delivery URL brokered to new bots; acts carry only signed turn capabilities.",
    "targets": []
+  },
+  {
+   "key": "BOT_WHISPER_WS_URL",
+   "class": "defaulted",
+   "default": "(unset - use batch transcription)",
+   "description": "Infrastructure-owned credential-free WhisperLive WebSocket endpoint forwarded to meeting bots.",
+   "targets": [
+    "compose"
+   ]
+  },
+  {
+   "key": "BOT_WHISPER_MODEL",
+   "class": "defaulted",
+   "default": "large-v3-turbo",
+   "description": "WhisperLive model name forwarded to the streaming meeting adapter.",
+   "targets": [
+    "compose"
+   ]
+  },
+  {
+   "key": "BOT_WHISPER_EARLY_FINAL",
+   "class": "defaulted",
+   "default": "true",
+   "description": "Promote two matching current-tail decodes after speech silence; false keeps server-confirmed finals.",
+   "targets": [
+    "compose"
+   ]
   }
  ],
  "capabilities": {

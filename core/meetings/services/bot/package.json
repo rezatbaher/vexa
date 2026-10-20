@@ -9,17 +9,17 @@
     "build": "tsc && node build-browser-utils.mjs",
     "build:browser-utils": "node build-browser-utils.mjs",
     "start": "tsx src/index.ts",
-    "test": "tsx src/config.test.ts && tsx src/orchestrator.test.ts && tsx src/signals.test.ts && tsx src/entrypoint.test.ts && tsx src/join-driver.test.ts && tsx src/stress.test.ts && tsx src/adapters/lifecycle-http.test.ts && tsx src/adapters/transcript-redis.test.ts && tsx src/adapters/acts-redis.test.ts && tsx src/pipeline.test.ts && tsx src/speaker-hints.test.ts && tsx src/capture-bridge.boundary.test.ts && tsx src/live-pipeline.test.ts && tsx src/recording.test.ts && tsx src/telemetry.test.ts && tsx src/telemetry-recorder.test.ts && tsx src/replay.test.ts && tsx src/zoom-speaker-wiring.test.ts && tsx mock/mock.test.ts && tsx src/meeting-speech.test.ts && tsx src/meeting-delivery.test.ts",
+    "test": "tsx src/config.test.ts && tsx src/orchestrator.test.ts && tsx src/signals.test.ts && tsx src/entrypoint.test.ts && tsx src/join-driver.test.ts && tsx src/stress.test.ts && tsx src/adapters/lifecycle-http.test.ts && tsx src/adapters/transcript-redis.test.ts && tsx src/adapters/acts-redis.test.ts && tsx src/pipeline.test.ts && tsx src/speaker-hints.test.ts && tsx src/capture-bridge.boundary.test.ts && tsx src/live-pipeline.test.ts && tsx src/recording.test.ts && tsx src/telemetry.test.ts && tsx src/telemetry-recorder.test.ts && tsx src/replay.test.ts && tsx src/zoom-speaker-wiring.test.ts && tsx mock/mock.test.ts && tsx src/meeting-speech.test.ts && tsx src/meeting-delivery.test.ts && tsx src/streaming-gmeet.test.ts && tsx src/streaming-websocket.test.ts",
     "replay": "tsx src/replay.test.ts",
     "check:isolation": "node scripts/check-isolation.js"
   },
   "dependencies": {
-    "@vexa/join": "workspace:*",
-    "@vexa/remote-browser": "workspace:*",
-    "@vexa/recording": "workspace:*",
-    "@vexa/record-chunker": "workspace:*",
     "@vexa/gmeet-pipeline": "workspace:*",
+    "@vexa/join": "workspace:*",
     "@vexa/mixed-pipeline": "workspace:*",
+    "@vexa/record-chunker": "workspace:*",
+    "@vexa/recording": "workspace:*",
+    "@vexa/remote-browser": "workspace:*",
     "@vexa/transcribe-whisper": "workspace:*",
     "ajv": "^8.17.0",
     "ajv-formats": "^3.0.1",
@@ -27,9 +27,11 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
     "@vexa/capture-codec": "workspace:*",
     "esbuild": "^0.25.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "ws": "^8.21.0"
   }
 }

@@ -157,6 +157,9 @@ services:
       - AGENT_WORKER_IMAGE=${AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:${IMAGE_TAG:-dev}}
       # Optional low-latency tuning for the Google Meet speaker-stream pipeline. Empty values keep
       # the bot defaults; runtime forwards configured values to spawned bot containers.
+      - BOT_WHISPER_WS_URL=${BOT_WHISPER_WS_URL:-}
+      - BOT_WHISPER_MODEL=${BOT_WHISPER_MODEL:-large-v3-turbo}
+      - BOT_WHISPER_EARLY_FINAL=${BOT_WHISPER_EARLY_FINAL:-true}
       - BOT_SPEAKER_MIN_AUDIO_SEC=${BOT_SPEAKER_MIN_AUDIO_SEC:-}
       - BOT_SPEAKER_SUBMIT_INTERVAL_SEC=${BOT_SPEAKER_SUBMIT_INTERVAL_SEC:-}
       - BOT_SPEAKER_CONFIRM_THRESHOLD=${BOT_SPEAKER_CONFIRM_THRESHOLD:-}

@@ -187,3 +187,13 @@ def test_command_overrides_ignore_blank_env(monkeypatch):
     reg = apply_command_overrides(default_registry())
     assert reg.resolve("meeting-bot").command is None  # image ENTRYPOINT is authoritative (#675)
     assert reg.resolve("agent").command == ["python", "-m", "worker"]
+
+
+def test_meeting_bot_forwards_whisper_streaming_endpoint_and_policy(monkeypatch):
+    monkeypatch.setenv("BOT_WHISPER_WS_URL", "ws://whisper-live:9090")
+    monkeypatch.setenv("BOT_WHISPER_MODEL", "large-v3-turbo")
+    monkeypatch.setenv("BOT_WHISPER_EARLY_FINAL", "false")
+    env = default_registry().get("meeting-bot").base_env
+    assert env["BOT_WHISPER_WS_URL"] == "ws://whisper-live:9090"
+    assert env["BOT_WHISPER_MODEL"] == "large-v3-turbo"
+    assert env["BOT_WHISPER_EARLY_FINAL"] == "false"

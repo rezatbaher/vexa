@@ -395,6 +395,9 @@ importers:
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.43
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
       '@vexa/capture-codec':
         specifier: workspace:*
         version: link:../../modules/capture-codec
@@ -407,6 +410,9 @@ importers:
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
+      ws:
+        specifier: ^8.21.0
+        version: 8.21.0
 
   core/meetings/services/desktop:
     dependencies:

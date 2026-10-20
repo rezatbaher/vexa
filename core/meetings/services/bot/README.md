@@ -69,3 +69,25 @@ autonomous PASS/FAIL verdict (`make -C eval verify` for the offline oracle self-
 - ✅ delivered — `acts.v1` ingress (redis subscriber; unknown acts dropped, never thrown)
 - ✅ delivered — recording assembler core (webm/wav/seq, L2/L3)
 - 🟡 partial — browser join + capture + recording-upload + speak (wired; L4-gated, proven on VM via `eval/`, not unit tests)
+
+
+## Optional WhisperLive streaming (Google Meet)
+
+Set `BOT_WHISPER_WS_URL` on runtime to a credential-free private `ws://` or `wss://` endpoint
+reachable from spawned bots. Compose forwards it with `BOT_WHISPER_MODEL` (default
+`large-v3-turbo`) and `BOT_WHISPER_EARLY_FINAL` (default `true`). Without a URL the batch lane
+is retained. The adapter uses Node22+ native WebSocket; no new production dependency.
+
+One immutable channel/name stream sends16kHz Float32 binary PCM after `SERVER_READY`.
+Real-time silence fills omitted quiet capture frames. Two matching fresh tail decodes can finish
+after450ms speech silence (1100ms for an incomplete English tail); disabling early final waits for
+server-confirmed segments. Delayed server callbacks cannot duplicate an ended utterance. Source
+timing uses conservative bounds of original PCM frames, independently of padded decoder offsets.
+Mapping never evicts provenance; its hard limit fails the stream with a typed fault.
+
+Connection buffers are capped at8s, capacity faults back off3s, and speaker rotation/shutdown drain
+up to8s while preserving the old name. The deployed faster-whisper backend closes immediately on
+binary `END_OF_AUDIO`, so draining precedes that marker. Retired failures never throttle a healthy
+successor. No PCM or transcript content is logged. `streaming-gmeet.test.ts` covers the real pipeline
+selection with10 fake channels; `streaming-websocket.test.ts` verifies actual native WebSocket JSON
+and binary transport against a local protocol fixture. These do not establish live Meet latency.

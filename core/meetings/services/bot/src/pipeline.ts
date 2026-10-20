@@ -31,6 +31,7 @@ import {
   type HintKind,
 } from '@vexa/mixed-pipeline';
 import { TranscriptionClient, type TranscriptionResult } from '@vexa/transcribe-whisper';
+import { createStreamingGmeet, type StreamingOptions } from './streaming-gmeet.js';
 import { isMixedLanePlatform, type Invocation, type Platform } from './config.js';
 import type { TranscriptSegment } from './contracts.js';
 import type { Pipeline, TranscriptSink } from './ports.js';
@@ -249,6 +250,7 @@ export function createBotPipeline(
   inv: Invocation,
   sink: TranscriptSink,
   opts: {
+    streaming?: StreamingOptions;
     transcribe?: Transcribe;
     config?: SpeakerStreamManagerConfig;
     onError?: (e: unknown) => void;
@@ -257,6 +259,10 @@ export function createBotPipeline(
     createMixedTranscriber?: MixedTranscriberFactory;
   } = {},
 ): BotPipeline {
+  if (inv.platform === 'google_meet' && inv.transcribeEnabled !== false && opts.streaming) {
+    return createStreamingGmeet(sink, { ...opts.streaming, language: inv.language ?? undefined,
+      model: opts.streaming.model ?? inv.transcriptionModel ?? 'large-v3-turbo', onError: opts.onError });
+  }
   const transcribe = opts.transcribe ?? createTranscribe(inv);
   if (isMixedLanePlatform(inv.platform)) {
     return createMixedBotPipeline(

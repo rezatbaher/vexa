@@ -167,3 +167,14 @@ export function speakerStreamConfigFromEnv(
   }
   return configured ? config : undefined;
 }
+
+/** Deployment-owned WebSocket opt-in. Never derive a credential-bearing URL from invocation data. */
+export function whisperStreamingFromEnv(env: NodeJS.ProcessEnv = process.env) {
+  const raw = env.BOT_WHISPER_WS_URL?.trim();
+  if (!raw) return undefined;
+  const url = new URL(raw);
+  if (!['ws:', 'wss:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new InvocationError('BOT_WHISPER_WS_URL must be a credential-free ws/wss endpoint');
+  }
+  return { url: url.href, model: env.BOT_WHISPER_MODEL?.trim() || 'large-v3-turbo', earlyFinal: env.BOT_WHISPER_EARLY_FINAL !== 'false' };
+}

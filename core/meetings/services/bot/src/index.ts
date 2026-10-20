@@ -23,7 +23,7 @@
  * lazy redis connect.
  */
 import { createClient } from 'redis';
-import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
+import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, whisperStreamingFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent } from './contracts.js';
 import { createOrchestrator } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
@@ -212,6 +212,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       // When recording, tee every STT round-trip to <session>.stt.jsonl (the capture/STT/assembly bisect).
       transcribe: signalRecorder ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,
       config: speakerStreamConfig,
+      streaming: whisperStreamingFromEnv(env),
       onError: (e) => console.error(`[bot] pipeline fault: ${String(e)}`),
     });
     // Defer the page-side capture start to pipeline.start(): the orchestrator calls it AFTER

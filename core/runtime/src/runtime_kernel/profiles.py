@@ -99,6 +99,9 @@ def default_registry() -> ProfileRegistry:
     speaker_stream_env = {
         key: os.environ[key]
         for key in (
+            "BOT_WHISPER_WS_URL",
+            "BOT_WHISPER_MODEL",
+            "BOT_WHISPER_EARLY_FINAL",
             "BOT_SPEAKER_MIN_AUDIO_SEC",
             "BOT_SPEAKER_SUBMIT_INTERVAL_SEC",
             "BOT_SPEAKER_CONFIRM_THRESHOLD",
