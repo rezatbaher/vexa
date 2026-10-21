@@ -122,11 +122,12 @@ async function main(): Promise<void> {
 
     // Real Google-shaped controls: settings is NOT the toggle; React updates later.
     await page.setContent(`<button aria-label="Microphone settings" onclick="window.settingsClicked=true">settings</button>
-      <button id="mic" aria-label="Turn on microphone" onclick="window.micClicks=(window.micClicks||0)+1;setTimeout(()=>this.setAttribute('aria-label','Turn off microphone'),350)">mic</button>`);
+      <button id="mic" aria-label="Turn on microphone" onclick="window.micClicks=(window.micClicks||0)+1;window.micTrusted=event.isTrusted;setTimeout(()=>this.setAttribute('aria-label','Turn off microphone'),350)">mic</button>`);
     await page.evaluate('globalThis.__name = (t, v) => t;');
     const started = Date.now();
     check('Google microphone awaits delayed unmute', await ensureMeetingMicUnmuted(page, 'google_meet') && Date.now() - started >= 300);
     check('microphone control clicked once; settings untouched', await page.evaluate('window.micClicks===1 && !window.settingsClicked'));
+    check('microphone toggled by TRUSTED input (Meet ignores a DOM click for the mic)', await page.evaluate('window.micTrusted===true'));
     check('already unmuted microphone stays unmuted', await ensureMeetingMicUnmuted(page, 'google_meet') && await page.evaluate('window.micClicks===1'));
     await page.evaluate(`document.getElementById('mic').setAttribute('aria-label','Turn on microphone');document.getElementById('mic').onclick=()=>{window.micClicks++}`);
     check('unconfirmed microphone fails closed without toggling twice', !await ensureMeetingMicUnmuted(page, 'google_meet') && await page.evaluate('window.micClicks===2'));
