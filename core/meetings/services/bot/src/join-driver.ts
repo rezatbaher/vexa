@@ -70,6 +70,7 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
           passcode: inv.passcode,                      // zoom passcode screen / jitsi room password
           authenticated: inv.authenticated,            // join as a signed-in user (persistent context)
           waitingRoomTimeoutMs: inv.automaticLeave?.waitingRoomTimeout,
+          voiceAgentEnabled: !!inv.voiceAgentEnabled,  // keep the meeting mic ON for a speaking bot
           hooks: { onState: (s: JoinState) => { const bs = mapState(s); if (bs) void report(bs); } },
         });
       } catch (e) {

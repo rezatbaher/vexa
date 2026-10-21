@@ -2,30 +2,42 @@
 import type { BrowserContext, Page } from '@vexa/remote-browser';
 
 export async function ensureMeetingMicUnmuted(page: Page, platform: string): Promise<boolean> {
-  return page.evaluate(async ({ platform }) => {
+  // Read (and tag) the platform's microphone toggle: 'on' | 'off' | 'disabled' | 'missing'.
+  const state = (): Promise<string> => page.evaluate(({ platform }) => {
     const doc = (globalThis as any).document;
-    let clicked = false;
     const label = (button: any) => String(button.getAttribute('aria-label') || button.getAttribute('data-tooltip') || '').toLowerCase();
     const off = (value: string) => /turn on|unmute|mic is off|microphone is off/.test(value);
     const on = (value: string) => !off(value) && /turn off|mute microphone|mute my|mute audio/.test(value);
     const visible = (button: any) => button.getClientRects().length > 0;
-    for (let attempt = 0; attempt < 16; attempt++) {
-      const button = platform === 'teams' ? doc.querySelector('#microphone-button')
-        : platform === 'zoom' ? doc.querySelector('.join-audio-container__btn')
-        : (Array.from(doc.querySelectorAll('button,[role="button"]')) as any[]).find(button =>
-            visible(button) && /microphone|mute audio/.test(label(button)) && (on(label(button)) || off(label(button))));
-      if (button && visible(button)) {
-        const current = label(button);
-        if (on(current)) return true;
-        if (!clicked && off(current) && !button.disabled) {
-          button.click();
-          clicked = true;
-        }
+    doc.querySelectorAll('[data-vexa-mic]').forEach((el: any) => el.removeAttribute('data-vexa-mic'));
+    const button = platform === 'teams' ? doc.querySelector('#microphone-button')
+      : platform === 'zoom' ? doc.querySelector('.join-audio-container__btn')
+      : (Array.from(doc.querySelectorAll('button,[role="button"]')) as any[]).find(button =>
+          visible(button) && /microphone|mute audio/.test(label(button)) && (on(label(button)) || off(label(button))));
+    if (!button || !visible(button)) return 'missing';
+    const current = label(button);
+    if (on(current)) return 'on';
+    if (!off(current)) return 'missing';
+    if (button.disabled || button.getAttribute('aria-disabled') === 'true') return 'disabled';
+    button.setAttribute('data-vexa-mic', '1');
+    return 'off';
+  }, { platform }).catch(() => 'missing');
+  let clicked = false;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const current = await state();
+    if (current === 'on') return true;
+    if (current === 'off' && !clicked) {
+      clicked = true;
+      // Trusted input (CDP mouse event): Meet turns the microphone on for a real user gesture, and a
+      // DOM click() is untrusted. Falls back to the DOM click only if the trusted one cannot land.
+      const landed = await page.click('[data-vexa-mic="1"]', { timeout: 1500, noWaitAfter: true }).then(() => true, () => false);
+      if (!landed) {
+        await page.evaluate(() => (globalThis as any).document.querySelector('[data-vexa-mic="1"]')?.click()).catch(() => {});
       }
-      if (attempt < 15) await new Promise(resolve => setTimeout(resolve, 100));
     }
-    return false;
-  }, { platform }).catch(() => false);
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
 }
 
 /** Install before navigation. Only captured tracks and their clones prove local origin. */

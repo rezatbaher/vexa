@@ -164,6 +164,24 @@ export async function joinGoogleMeeting(
     await page.fill(selector, text);
   };
 
+  // A RECORDER bot mutes its microphone in the lobby. A VOICE-AGENT bot must join with it ON: its
+  // audibility is gated at PulseAudio (virtual_mic stays muted between replies), and turning the Meet
+  // mic on later from inside the call is not reliable — 2026-10-21 every reply in meetings 41-43 failed
+  // with "voice unavailable" after the lobby click had muted it (meetings that never clicked it spoke).
+  const setLobbyMicrophone = async (timeout: number): Promise<void> => {
+    const voiceAgent = !!botConfig.voiceAgentEnabled;
+    const selector = voiceAgent ? 'button[aria-label*="Turn on microphone"]' : googleMicrophoneButtonSelectors[0];
+    try {
+      const micHandle = await page.waitForSelector(selector, { timeout });
+      if (micHandle) {
+        await clickHandle(micHandle, "microphone");
+        log(voiceAgent ? "Voice agent: microphone turned on in the lobby." : "Microphone muted.");
+      }
+    } catch (e) {
+      log(voiceAgent ? "Voice agent: microphone already on (or not found) in the lobby." : "Microphone already muted or not found.");
+    }
+  };
+
   if (botConfig.authenticated) {
     // Authenticated flow: browser is logged into Google, skip name input
     log("Authenticated mode: skipping name input (using Google account identity)");
@@ -176,13 +194,8 @@ export async function joinGoogleMeeting(
     await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-lobby.png', fullPage: true });
     log("📸 Diagnostic screenshot: auth lobby state");
 
-    // Mute mic and camera if visible
-    try {
-      const micHandle = await page.waitForSelector(googleMicrophoneButtonSelectors[0], { timeout: 3000 });
-      if (micHandle) { await clickHandle(micHandle, "microphone"); log("Microphone muted."); }
-    } catch (e) {
-      log("Microphone already muted or not found.");
-    }
+    // Mute mic (recorder bots) and camera if visible
+    await setLobbyMicrophone(3000);
 
     try {
       const cameraHandle = await page.waitForSelector(googleCameraButtonSelectors[0], { timeout: 3000 });
@@ -238,13 +251,8 @@ export async function joinGoogleMeeting(
 
     await fillField(nameHandle!, nameFieldSelector, botName, "name");
 
-    // Mute mic and camera if available
-    try {
-      const micHandle = await page.waitForSelector(googleMicrophoneButtonSelectors[0], { timeout: 1000 });
-      if (micHandle) await clickHandle(micHandle, "microphone");
-    } catch (e) {
-      log("Microphone already muted or not found.");
-    }
+    // Mute mic (recorder bots) and camera if available
+    await setLobbyMicrophone(1000);
 
     try {
       const cameraHandle = await page.waitForSelector(googleCameraButtonSelectors[0], { timeout: 1000 });
