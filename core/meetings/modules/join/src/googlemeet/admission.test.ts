@@ -50,7 +50,10 @@ function mockPage(visible: string[], recaptcha = false, participantLabels: strin
         getAttribute: async () => null,
       }),
       count: async () => (visible.includes(sel) ? 1 : 0),
-      evaluateAll: async () => participantLabels,
+      evaluateAll: async (fn: any) => fn(participantLabels.map((label, i) => ({
+        getAttribute: (key: string) => key === 'data-participant-id' ? String(i) : key === 'aria-label' ? label : null,
+        hasAttribute: () => false,
+      }))),
     }),
     mouse: { move: async () => {} },
     frames: () => (recaptcha

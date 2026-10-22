@@ -81,7 +81,6 @@ export async function checkForGoogleRejection(page: Page): Promise<boolean> {
  * A REAL participant tile (self once in-call, or any remote) has a human-name label.
  * Presence of >=1 such tile is a POSITIVE admitted signal independent of that guard.
  */
-const EFFECTS_TILE = /visual_effects|backgrounds and effects/i;
 
 /** The ONE tile reader. Returns `null` when the DOM could not be read at all.
  *
@@ -93,10 +92,17 @@ const EFFECTS_TILE = /visual_effects|backgrounds and effects/i;
  * live call. Callers that act on absence take this variant and treat `null` as "no evidence". */
 export async function countRealParticipantTilesStrict(page: Page): Promise<number | null> {
   try {
-    const labels = await page.locator("[data-participant-id]").evaluateAll(
-      els => els.map(e => e.getAttribute("aria-label") || (e.textContent || "").trim()),
+    const ids = await page.locator("[data-participant-id]").evaluateAll(
+      els => els.filter(e => {
+        if (e.hasAttribute("data-tile-media-id")) return true;
+        const ownLabel = (e.getAttribute("aria-label") || "").trim();
+        const effects = /visual_effects|backgrounds and effects/i;
+        if (ownLabel) return !effects.test(ownLabel);
+        const text = (e.textContent || "").trim();
+        return !!text && !effects.test(text);
+      }).map(e => e.getAttribute("data-participant-id") || ""),
     );
-    return labels.filter(l => l && !EFFECTS_TILE.test(l)).length;
+    return new Set(ids.filter(Boolean)).size;
   } catch {
     return null;
   }

@@ -82,6 +82,9 @@ export function canTransition(from: BotStatus, to: BotStatus): boolean {
 
 /** A control-plane → bot command. Discriminated by `action` (acts.v1 `#/$defs/Act`). */
 export type Act =
+  | { action: 'presentation_show'; sequence: number; presentation_id: string; token: string; room_revision: string; page: number }
+  | { action: 'presentation_stop'; sequence: number }
+  | { action: 'meeting_control'; request_id: string; revision: number; notes_enabled?: boolean; replies_muted?: boolean }
   | { action: 'leave' }
   | { action: 'reconfigure'; language?: string | null; task?: string | null; allowedLanguages?: string[] }
   | { action: 'speak'; text: string; voice?: string }
@@ -99,7 +102,7 @@ export type Act =
 export type ActAction = Act['action'];
 
 export const ACT_ACTIONS: readonly ActAction[] = [
-  'leave', 'reconfigure',
+  'presentation_show', 'presentation_stop', 'meeting_control', 'leave', 'reconfigure',
   'speak', 'speak_stream', 'chat_stream', 'speak_audio', 'speak_stop',
   'chat_send', 'chat_read',
   'screen_show', 'screen_stop', 'avatar_set', 'avatar_reset',
@@ -112,6 +115,27 @@ export const actsChannel = (meetingId: string | number): string => `bot_commands
 export function parseAct(msg: unknown): Act | null {
   if (!msg || typeof msg !== 'object') return null;
   const action = (msg as { action?: unknown }).action;
+  if (action === 'presentation_stop') {
+    const v = msg as Record<string, unknown>;
+    if (Object.keys(v).some(k => !['action', 'sequence'].includes(k)) || !Number.isSafeInteger(v.sequence) || Number(v.sequence) < 1) return null;
+  }
+  if (action === 'presentation_show') {
+    const v = msg as Record<string, unknown>;
+    if (Object.keys(v).some(k => !['action', 'presentation_id', 'token', 'room_revision', 'page', 'sequence'].includes(k)) ||
+      !Number.isSafeInteger(v.sequence) || Number(v.sequence) < 1 ||
+      typeof v.presentation_id !== 'string' || !/^[0-9a-f-]{36}$/i.test(v.presentation_id) ||
+      typeof v.token !== 'string' || v.token.length > 2048 || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(v.token) ||
+      typeof v.room_revision !== 'string' || v.room_revision.length > 100 ||
+      !Number.isSafeInteger(v.page) || Number(v.page) < 1 || Number(v.page) > 100) return null;
+  }
+  if (action === 'meeting_control') {
+    const v = msg as Record<string, unknown>;
+    if (Object.keys(v).some(k => !['action', 'request_id', 'revision', 'notes_enabled', 'replies_muted'].includes(k)) ||
+      typeof v.request_id !== 'string' || !/^[0-9a-f-]{36}$/i.test(v.request_id) ||
+      !Number.isSafeInteger(v.revision) || Number(v.revision) < 1 ||
+      ('notes_enabled' in v && typeof v.notes_enabled !== 'boolean') ||
+      ('replies_muted' in v && typeof v.replies_muted !== 'boolean')) return null;
+  }
   if (action === 'speak_stream' || action === 'chat_stream') {
     const value = msg as Record<string, unknown>;
     if (Object.keys(value).some(k => !['action', 'speech_id', 'stream_token'].includes(k)) ||

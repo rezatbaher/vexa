@@ -152,6 +152,7 @@ def build_invocation(
     transcription_service_token: Optional[str] = None,
     transcription_model: Optional[str] = None,
     authenticated: Optional[bool] = None,
+    userdata_read_only: bool = False,
     userdata_s3_path: Optional[str] = None,
     s3_endpoint: Optional[str] = None,
     s3_bucket: Optional[str] = None,
@@ -194,6 +195,7 @@ def build_invocation(
         # scoped — set by the BOT_AUTHENTICATED knob in ``request_bot``; None-stripped otherwise
         # so anonymous invocations carry no auth fields at all.
         "authenticated": authenticated,
+        "userdataReadOnly": True if userdata_read_only else None,
         "userdataS3Path": userdata_s3_path,
         "s3Endpoint": s3_endpoint,
         "s3Bucket": s3_bucket,

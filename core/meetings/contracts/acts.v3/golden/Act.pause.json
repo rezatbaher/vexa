@@ -1,0 +1,6 @@
+{
+  "action": "meeting_control",
+  "request_id": "12345678-1234-1234-1234-123456789012",
+  "revision": 1,
+  "notes_enabled": false
+}

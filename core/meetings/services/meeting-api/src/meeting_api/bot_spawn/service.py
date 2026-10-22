@@ -226,6 +226,7 @@ async def request_bot(
     # pathwarden patch: per-request authenticated opt-in — see resolve_authenticated. ``None`` ⇒
     # the BOT_AUTHENTICATED env default, so a caller that never sends the field is unchanged.
     authenticated: Optional[bool] = None,
+    concurrent_authenticated: bool = False,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -346,7 +347,7 @@ async def request_bot(
     #     (the issue's default); it runs just before the row insert, so the remaining window is a
     #     single request interleaving — the storage-side lock fork stays available if a multi-
     #     replica deployment ever witnesses it.
-    if authenticated and auth_userdata_path:
+    if authenticated and auth_userdata_path and not concurrent_authenticated:
         conflict = await repo.find_active_by_userdata(auth_userdata_path)
         if conflict is not None and (reused_row is None or conflict["id"] != reused_row["id"]):
             log_event(
@@ -451,6 +452,7 @@ async def request_bot(
         capture_modes=(["audio", "video"] if recording_enabled else None),
         recording_upload_url=f"{meeting_api_url}/internal/recordings/upload",
         authenticated=True if authenticated else None,
+        userdata_read_only=bool(authenticated and concurrent_authenticated),
         userdata_s3_path=auth_userdata_path,
         s3_endpoint=auth_s3.get("s3_endpoint"),
         s3_bucket=auth_s3.get("s3_bucket"),

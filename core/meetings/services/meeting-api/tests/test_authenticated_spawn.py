@@ -206,3 +206,34 @@ async def test_a_guest_spawn_is_never_blocked_by_a_busy_session(monkeypatch):
     assert len(runtime.specs) == 2
     guest = json.loads(runtime.specs[1]["env"]["VEXA_BOT_CONFIG"])
     assert not any(f in guest for f in AUTH_FIELDS)
+
+
+async def test_four_concurrent_signed_in_meetings_use_read_only_seed_copies(monkeypatch):
+    _set_auth_env(monkeypatch)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    for index in range(4):
+        result = await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+            native_meeting_id=f"test-room-{index}", bot_name="VOXAI", redis_url="redis://redis:6379/0",
+            meeting_api_url="http://meeting-api:8080", token_secret=SECRET,
+            authenticated=True, concurrent_authenticated=True)
+        assert result
+    assert len(runtime.specs) == 4
+    for spec in runtime.specs:
+        invocation = json.loads(spec["env"]["VEXA_BOT_CONFIG"])
+        assert invocation["userdataReadOnly"] is True
+        conforms_invocation(invocation)
+
+
+@pytest.mark.parametrize("recording", ["true", "false"])
+def test_concurrency_parser_requires_explicit_boolean_opt_in(monkeypatch, recording):
+    from fastapi import HTTPException
+    from meeting_api.bot_spawn.router import _resolve_concurrent_authenticated
+    monkeypatch.setenv("RECORDING_ENABLED", recording)
+    assert _resolve_concurrent_authenticated(None) is False
+    assert _resolve_concurrent_authenticated(False) is False
+    assert _resolve_concurrent_authenticated(True) is True
+    for value in ("true", "false", 1, 0, {}, []):
+        with pytest.raises(HTTPException) as exc:
+            _resolve_concurrent_authenticated(value)
+        assert exc.value.status_code == 422
+        assert "concurrent_authenticated" in exc.value.detail

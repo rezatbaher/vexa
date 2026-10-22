@@ -56,7 +56,8 @@ async function run(
   const stop = startGoogleAlonenessMonitor(
     mockPage(state),
     () => { fires++; },
-    { timeoutMs, pollMs: 1, now: () => fakeNow },
+    { timeoutMs, pollMs: 1, now: () => fakeNow,
+      readPresence: async () => state.throws ? "unknown" : state.tiles.length === 1 && state.tiles[0] === "Vexa Bot" ? "alone" : state.tiles.length >= 2 ? "occupied" : "unknown" },
   );
   await sleep(30); // let the first polls land
   for (const s of steps) {
@@ -81,9 +82,9 @@ async function run(
 
   // 2. Post-call screen: the tiles are gone entirely. Same verdict — nobody is there.
   check(
-    'no tiles at all (post-call screen) past the window → fires',
+    'no tiles without proven self is unknown → stays',
     await run({ tiles: [] }, [{ advanceMs: 1500 }]),
-    1,
+    0,
   );
 
   // 3. Not yet elapsed → patience. The window is the whole safety margin.
@@ -121,22 +122,21 @@ async function run(
     0,
   );
 
-  // 7. …and a failed read mid-window neither arms nor clears: the window survives the blip, so a
-  //    genuinely empty room is still left (late, never early).
+  // Unknown observations break continuity; a new confirmed-empty interval is required.
   check(
-    'alone → read fails → alone again: window survives the blip and still fires',
+    'alone → unknown → alone requires a fresh continuous window',
     await run({ tiles: ['Vexa Bot'] }, [
       { advanceMs: 400 },
       { throws: true, advanceMs: 400 },
       { throws: false, advanceMs: 400 },
     ]),
-    1,
+    0,
   );
 
   // 8. One meeting, one leave: the callback must not be re-entered on later polls.
   check(
     'fires at most once',
-    await run({ tiles: [] }, [{ advanceMs: 2000 }, { advanceMs: 2000 }, { advanceMs: 2000 }]),
+    await run({ tiles: ['Vexa Bot'] }, [{ advanceMs: 2000 }, { advanceMs: 2000 }, { advanceMs: 2000 }]),
     1,
   );
 

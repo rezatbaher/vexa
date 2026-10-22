@@ -1,3 +1,4 @@
+import { installMeetingVisuals } from './meeting-visuals.js';
 import { ensureMeetingMicUnmuted, installLocalMediaTracker, ensureMeetingPeoplePanel } from './meeting-dom.js';
 /**
  * Capture bridge (2b) — the browser-resident capture → pipeline pump + the speak path.
@@ -163,7 +164,10 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   const args = [...getAuthenticatedBrowserArgs(), ...getJoinBrowserArgs()];
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
 
-  if (inv.platform === 'google_meet' && inv.voiceAgentEnabled) await installLocalMediaTracker(context);
+  if (inv.platform === 'google_meet' && inv.voiceAgentEnabled) {
+    await installLocalMediaTracker(context);
+    await installMeetingVisuals(context);
+  }
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
   await context.addInitScript(`window.__vexa_voice_agent_enabled = ${!!inv.voiceAgentEnabled};`);
@@ -233,7 +237,8 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
       // spawn restores the freshest state instead of a decaying snapshot. Clean teardown only:
       // a SIGKILL never reaches close(), so a hard-killed meeting keeps the last durable copy.
       // Failures are attributed warnings, bounded per upload — teardown never hangs on S3.
-      if (inv.authenticated && inv.userdataS3Path) {
+      // Concurrent bots restore independent copies of a read-only seed; only exclusive sessions write back.
+      if (inv.authenticated && inv.userdataS3Path && !inv.userdataReadOnly) {
         try {
           syncBrowserDataToS3(s3Config, dataDir);
         } catch (e) {
@@ -600,7 +605,7 @@ export async function startCaptureBridge(
  * stop) is the COMPLETED signal. Started post-admission (on the live meeting page, where the
  * participant <audio> elements exist), exactly like the capture bridge.
  */
-export async function startRecording(page: Page, inv: Invocation, recording: BotRecordingSink): Promise<() => Promise<void>> {
+export async function startRecording(page: Page, inv: Invocation, recording: BotRecordingSink, retain: () => boolean = () => true): Promise<() => Promise<void>> {
   await page.exposeFunction('__vexaRecordingStarted', (earliest: string, latest: string) => recording.started(earliest, latest)).catch(() => {});
   const key = `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`;
   // Recording part interval (ms): the MediaRecorder timeslice = the durable-upload granularity.
@@ -615,6 +620,7 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
   })();
   // Node-side: decode one base64 recording.v1 chunk → the per-chunk upload sink. mimeType→format.
   await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
+    if (!retain() && !(isFinal && !base64)) return;
     const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
     const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
     recording.chunk(key, chunkSeq, isFinal, format, bytes);

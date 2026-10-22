@@ -30,6 +30,7 @@ export interface RecordingChunk {
 export interface RecordingTap {
   start(): Promise<void>;
   stop(): Promise<void>;
+  setPaused(paused: boolean): Promise<boolean>;
 }
 
 /** Options a host passes to a lane recording tap. */
@@ -84,6 +85,14 @@ export class MediaRecorderChunker implements RecordingTap {
 
   constructor(opts: MediaRecorderChunkerOptions) {
     this.opts = opts;
+  }
+
+  async setPaused(paused: boolean): Promise<boolean> {
+    const recorder = this.recorder;
+    if (!recorder || recorder.state === 'inactive') return false;
+    if (paused && recorder.state === 'recording') { recorder.pause(); }
+    else if (!paused && recorder.state === 'paused') { recorder.resume(); }
+    return recorder.state === (paused ? 'paused' : 'recording');
   }
 
   /** The underlying MediaRecorder (null until start()). */
@@ -324,6 +333,9 @@ export function createRecordingTap(opts: CreateRecordingTapOptions): RecordingTa
         onStarted: opts.onStarted,
       });
       await chunker.start();
+    },
+    async setPaused(paused: boolean): Promise<boolean> {
+      return chunker ? chunker.setPaused(paused) : false;
     },
     async stop(): Promise<void> {
       await chunker?.stop();

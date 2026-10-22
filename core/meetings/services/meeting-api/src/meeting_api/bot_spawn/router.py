@@ -36,6 +36,15 @@ from .invocation import SPAWNABLE_PLATFORMS
 from .service import DuplicateMeeting, construct_meeting_url, request_bot
 
 
+def _resolve_concurrent_authenticated(value: Optional[object]) -> bool:
+    """Concurrent identity sessions require an explicit JSON boolean opt-in."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise HTTPException(status_code=422, detail="concurrent_authenticated must be a boolean")
+
+
 def _resolve_recording_enabled(value: Optional[object]) -> bool:
     """Recording default: an explicit request value wins; else the ``RECORDING_ENABLED`` env
     (default ``true``), so a dashboard bot records by default. The request value is type-validated —
@@ -311,6 +320,7 @@ def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
                 # pathwarden patch: per-request authenticated opt-in. Absent ⇒ the
                 # BOT_AUTHENTICATED deployment default (resolve_authenticated).
                 authenticated=body.get("authenticated"),
+                concurrent_authenticated=_resolve_concurrent_authenticated(body.get("concurrent_authenticated")),
                 max_concurrent=max_concurrent,
                 webhook_url=x_user_webhook_url,
                 webhook_secret=x_user_webhook_secret,

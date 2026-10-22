@@ -1,0 +1,8 @@
+{
+  "action": "presentation_show",
+  "presentation_id": "12345678-1234-1234-1234-123456789012",
+  "token": "fake.header.signature",
+  "page": 1,
+  "room_revision": "room",
+  "sequence": 1
+}

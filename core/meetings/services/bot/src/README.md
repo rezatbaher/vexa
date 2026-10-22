@@ -19,3 +19,21 @@ types; transports are adapters wired at the composition root.
 | `*.test.ts` | L1/L2/L3 — config (ajv goldens) · orchestrator (lifecycle.v1 sequence, fake ports) · lifecycle-http/transcript-redis/acts-redis (transports) · **pipeline (L3: capture→lane→stt→publish, overlap no cross-mislabel)** · **recording (L3: webm/wav/seq)**. |
 
 Tests run via `tsx` (no build step): `npx tsx src/<file>.test.ts`; all chained in `npm test`.
+
+
+## VOXAI candidate controls and presentation (2026-10-22)
+
+`meeting-control` serializes acts.v3 state changes and reports applied state; publication is only a
+request. Paused transcripts use a separate ephemeral command frame, never the collector. The recording
+tap pauses MediaRecorder, excludes retained chunks while paused and preserves empty completion markers.
+Failed recorder pause blocks subsequent retention until restart. Voice-enabled bots do not persist
+raw/STT debug tapes. Non-voice bots do not accept these controls.
+
+`meeting-presentation` pulls fixed page images from configured MEETING_SPEECH_URL. It authorizes before
+replacing a current share; sequence fences include stop. `meeting-visuals` binds canvas capture to the
+current complete browser roster before painting/acquisition and stops on change. A live capture track
+alone is not provider sharing confirmation. Camera avatar requests use only the static built-in card.
+
+Offline VM/HTTP tests exercise first-frame/decode races, stale commands, reordered responses, stale
+stops, failed pause and finalization. Actual Google screen/camera operation and concurrent account
+admission remain live acceptance gates. These changes are candidate-only and have not been deployed.

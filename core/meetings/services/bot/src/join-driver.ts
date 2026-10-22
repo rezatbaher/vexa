@@ -96,6 +96,7 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
       // guessed selector on a LEAVE decision is worse than the existing 4h backstop.
       if (platform !== 'google_meet') return () => { /* no verified presence signal */ };
       return startGoogleAlonenessMonitor(page as any, cb, {
+        readPresence: () => readGoogleRoomOccupancy(page),
         timeoutMs: inv.automaticLeave?.everyoneLeftTimeout,
       });
     },
@@ -127,4 +128,23 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
       } catch { /* best-effort */ }
     },
   };
+}
+
+/** Join owns lifecycle; the bot supplies the capture observer's structural room evidence. */
+export async function readGoogleRoomOccupancy(page: Page): Promise<'alone' | 'occupied' | 'unknown'> {
+  return page.evaluate(() => {
+    const g = globalThis as any;
+    const state = g.__vexaGmeetSpeakers?.getState?.();
+    const snapshot = g.__vexaRoomSnapshot?.();
+    if (!state || !Array.isArray(state.tiles)) return 'unknown';
+    const tiles = new Map<string, boolean>();
+    for (const tile of state.tiles) {
+      if (!tile.id) return 'unknown';
+      if (tiles.has(tile.id) && tiles.get(tile.id) !== (tile.self === true)) return 'unknown';
+      tiles.set(tile.id, tile.self === true);
+    }
+    if (tiles.size >= 2 || (Array.isArray(snapshot?.ids) && new Set(snapshot.ids).size >= 2)) return 'occupied';
+    if (!snapshot || snapshot.complete !== true || !Array.isArray(snapshot.ids)) return 'unknown';
+    return tiles.size === 1 && [...tiles.values()][0] === true && snapshot.ids.length === 0 ? 'alone' : 'unknown';
+  }).catch(() => 'unknown' as const);
 }

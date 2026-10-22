@@ -31,3 +31,6 @@ deploy/transcription/models/
 
 # Pathwarden deploy secrets (never commit)
 .deploy-secrets.env
+
+# Local pnpm development cache.
+/.pnpm-store/

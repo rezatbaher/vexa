@@ -2,39 +2,8 @@ import { Page } from "playwright";
 import { log } from "../_host";
 import { countRealParticipantTilesStrict } from "./admission";
 
-/**
- * "Everyone left" detection for Google Meet — the timer `automaticLeave.everyoneLeftTimeout` has
- * always described and never armed.
- *
- * The gap this closes (production, 2026-09-01): a bot was admitted, recorded 34 chunks, and at
- * 12:36 the last human left. Every speaker stream went to `max=0.0000`, Meet navigated the page to
- * its post-call screen, the bot re-injected its browser utils onto the new page and carried on —
- * for another 80 minutes at 37% of a CPU core, never emitting a final chunk, until a human killed
- * the container. Nothing in the bot was watching for the room emptying: `everyoneLeftTimeout` is
- * validated by the API, defaulted to 15 min, serialized into invocation.v1 and then read in exactly
- * one place — as a *floor input* to the 4h `maxActiveMs` backstop. `left_alone` is declared in
- * contracts.ts and was unreachable from bot code. So the only exits were an operator stop, the
- * platform rendering an end screen the removal poller happened to match, or 4 hours.
- *
- * ── Why PRESENCE and not silence ──────────────────────────────────────────────────────────────
- * Audio silence is NOT evidence a meeting is over — people mute and listen, and the control plane
- * pins the opposite invariant explicitly (`test_lifecycle_seam.py`: "a quiet-but-LIVE bot must NOT
- * be reaped on silence alone"). The per-speaker RMS gates already in the pipeline are transcription
- * concerns and deliberately have no lifecycle effect. This monitor therefore reads participant
- * TILES and never looks at audio.
- *
- * ── Why it can only ever be late, never early ─────────────────────────────────────────────────
- *  * A read that FAILS returns `null` and is treated as no evidence — it neither starts nor clears
- *    the clock. Fail-safe is "stay in the meeting"; a broken selector degrades to today's 4h cap
- *    rather than dropping the bot out of a live call.
- *  * The window is CONTINUOUS: one sighting of another participant clears it outright, so a
- *    transient layout/view change cannot accumulate toward a leave.
- *  * `<= 1` is the alone test because a seated bot renders its OWN tile — 1 means "just me", and 0
- *    means the tiles are gone entirely (the post-call screen the incident bot was sitting on).
- *
- * Meet only. Jitsi already ends reliably (`APP.conference.isJoined()` flips) and Zoom watches
- * navigation; Teams shares this gap but its DOM is not verified here, so it is left uncovered
- * rather than guessed at.
+/** Leave only after a continuous interval of positively established aloneness.
+ * Unknown DOM observations break continuity; audio silence is never presence evidence.
  */
 
 /** Poll cadence. 15s against a window measured in minutes — the removal monitor's 1.5s buys
@@ -53,11 +22,12 @@ export interface AlonenessOptions {
   pollMs?: number;
   /** Injectable clock — tests drive the window without sleeping. */
   now?: () => number;
+  readPresence?: () => Promise<"alone" | "occupied" | "unknown">;
 }
 
 /**
  * Watch for the meeting emptying out. Fires `onAlone` at most once, then stops polling.
- * Returns a stop fn. Never throws; a poll that throws is swallowed as "no evidence".
+ * Returns a stop fn. Observation failure breaks the confirmed-empty interval.
  */
 export function startGoogleAlonenessMonitor(
   page: Page,
@@ -79,14 +49,12 @@ export function startGoogleAlonenessMonitor(
 
   const tick = async (): Promise<void> => {
     if (fired) return;
-    const tiles = await countRealParticipantTilesStrict(page);
+    const presence = await (opts.readPresence ? opts.readPresence() :
+      countRealParticipantTilesStrict(page).then(count => count !== null && count >= 2 ? "occupied" : "unknown"))
+      .catch(() => "unknown" as const);
+    if (presence === "unknown") { aloneSince = null; return; }
 
-    // No evidence either way — hold the clock exactly where it is. Neither arming nor clearing on a
-    // failed read is what keeps a selector break from BOTH leaving a live meeting and silently
-    // disabling the timer.
-    if (tiles === null) return;
-
-    if (tiles >= 2) {
+    if (presence === "occupied") {
       if (aloneSince !== null) {
         log("[alone] another participant is present again — clearing the empty-room timer");
         aloneSince = null;
@@ -96,7 +64,7 @@ export function startGoogleAlonenessMonitor(
 
     if (aloneSince === null) {
       aloneSince = now();
-      log(`[alone] no other participants (${tiles} tile(s)) — starting the empty-room timer`);
+      log("[alone] confirmed self-only room — starting the empty-room timer");
       return;
     }
 
@@ -112,7 +80,7 @@ export function startGoogleAlonenessMonitor(
   const interval = setInterval(() => {
     // setInterval does not await: an unhandled rejection here would be invisible AND would leave the
     // timer running with no further effect. Swallow to "no evidence" and try again next poll.
-    void tick().catch((e: any) => log(`[alone] poll error (ignored): ${e?.message ?? e}`));
+    void tick().catch((e: any) => { aloneSince = null; log(`[alone] observation unavailable: ${e?.message ?? e}`); });
   }, pollMs);
 
   const stop = (): void => { clearInterval(interval); };

@@ -77,6 +77,48 @@ def build_voice_router(repo: MeetingRepo, publisher: CommandPublisher) -> APIRou
     ):
         mid = await _resolve_meeting_id(platform, native_meeting_id, x_user_id)
         body = await _json_body(request)
+        if "avatar" in body:
+            value = body["avatar"]
+            if type(value) is not bool:
+                raise HTTPException(422, "Avatar must be enabled or disabled")
+            await _publish(mid, {"action": "avatar_set", "url": "voxai:default"} if value else {"action": "avatar_reset"})
+            return {"status": "requested"}
+        if "presentation" in body:
+            value = body["presentation"]
+            if not isinstance(value, dict):
+                raise HTTPException(422, "Invalid presentation request")
+            if set(value) == {"stop", "sequence"} and value["stop"] is True and type(value["sequence"]) is int and 1 <= value["sequence"] <= 9007199254740991:
+                await _publish(mid, {"action": "presentation_stop", "sequence": value["sequence"]})
+                return {"status": "stop_requested"}
+            if set(value) != {"presentation_id", "token", "room_revision", "page", "sequence"}:
+                raise HTTPException(422, "Invalid presentation request")
+            try:
+                sid = str(uuid.UUID(value["presentation_id"]))
+            except (ValueError, TypeError, AttributeError):
+                raise HTTPException(422, "Invalid presentation ID") from None
+            if (type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 9007199254740991
+                or type(value["page"]) is not int or not 1 <= value["page"] <= 100
+                or not isinstance(value["token"], str) or len(value["token"]) > 2048
+                or not re.fullmatch(r"[\w-]+\.[\w-]+\.[\w-]+", value["token"])
+                or not isinstance(value["room_revision"], str) or not 1 <= len(value["room_revision"]) <= 100):
+                raise HTTPException(422, "Invalid presentation capability")
+            await _publish(mid, {"action": "presentation_show", **value, "presentation_id": sid})
+            return {"status": "requested"}
+        if "control" in body:
+            control = body["control"]
+            if not isinstance(control, dict) or set(control) - {"request_id", "revision", "notes_enabled", "replies_muted"}:
+                raise HTTPException(422, "Invalid meeting control")
+            try:
+                request_id = str(uuid.UUID(control["request_id"]))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise HTTPException(422, "A control request ID is required") from None
+            revision = control.get("revision")
+            if type(revision) is not int or revision < 1 or revision > 9007199254740991:
+                raise HTTPException(422, "A positive control revision is required")
+            if any(type(control[k]) is not bool for k in ("notes_enabled", "replies_muted") if k in control):
+                raise HTTPException(422, "Control states must be booleans")
+            await _publish(mid, {"action": "meeting_control", **control, "request_id": request_id})
+            return {"status": "accepted", "request_id": request_id, "meeting_id": mid}
         text = body.get("text")
         audio_b64 = body.get("audio_base64")
         audio_url = body.get("audio_url")

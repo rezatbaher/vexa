@@ -23,6 +23,8 @@
  * lazy redis connect.
  */
 import { createClient } from 'redis';
+import { createMeetingPresentation } from './meeting-presentation.js';
+import { createMeetingControl } from './meeting-control.js';
 import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, whisperStreamingFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent } from './contracts.js';
 import { createOrchestrator } from './orchestrator.js';
@@ -180,10 +182,19 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // subscribe surfaces the error and the orchestrator drives to a clean terminal `failed`.
   const transcriptClient = redisClientFrom(inv.redisUrl);
   const actsClient = redisActsClientFrom(inv.redisUrl);
-  const transcript: TranscriptSink = createRedisTranscriptSink({
+  const storedTranscript: TranscriptSink = createRedisTranscriptSink({
     client: transcriptClient, meetingId, nativeMeetingId: inv.nativeMeetingId,
   });
   const liveActs = createRedisActsSource({ client: actsClient, meetingId });
+  let setRecordingPaused = async (_paused: boolean): Promise<boolean> => !inv.recordingEnabled;
+  let stopSpeaking = async (): Promise<void> => {};
+  const controls = createMeetingControl({ transcript: storedTranscript,
+    recordingConfigured: !!inv.recordingEnabled, transcriptionConfigured: inv.transcribeEnabled !== false,
+    setRecordingPaused: paused => setRecordingPaused(paused), stopSpeaking: () => stopSpeaking(),
+    publish: frame => transcriptClient.publish(`tc:meeting:${meetingId}:mutable`, JSON.stringify({ ...frame, meeting: { id: meetingId } })),
+  });
+  const transcript = controls.sink;
+
 
   // ── 2b: launch the browser + wire join / capture / recording / speak (L4-gated). ──
   // Browser-launch failure must NOT crash the root: fall back to the no-browser drivers so the
@@ -198,7 +209,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
   // enables it without a control plane (the local hot-loop path).
   const signalRecorder: CaptureSignalRecorder | null =
-    (inv.captureSignalEnabled ?? env.VEXA_CAPTURE_SIGNAL === '1')
+    !inv.voiceAgentEnabled && (inv.captureSignalEnabled ?? env.VEXA_CAPTURE_SIGNAL === '1')
       ? createCaptureSignalRecorder(inv)
       : null;
   if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
@@ -210,7 +221,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     join = createBrowserJoinDriver(session.page, inv);
     botPipeline = createBotPipeline(inv, transcript, {
       // When recording, tee every STT round-trip to <session>.stt.jsonl (the capture/STT/assembly bisect).
-      transcribe: signalRecorder ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,
+      // Voice-enabled meetings never persist debug STT responses: a batch may span a notes pause.
+      transcribe: signalRecorder && !inv.voiceAgentEnabled ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,
       config: speakerStreamConfig,
       streaming: whisperStreamingFromEnv(env),
       onError: (e) => console.error(`[bot] pipeline fault: ${String(e)}`),
@@ -226,9 +238,24 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
         type: 'meeting.activity.v1', meeting: { id: meetingId }, duration_ms: 300, observed_at: new Date().toISOString(),
       })).catch(() => {});
     });
+    stopSpeaking = () => speak.stop();
+    setRecordingPaused = async paused => !inv.recordingEnabled || sess.page.evaluate(async paused => {
+      const tap = (globalThis as any).__vexaRecordingTap;
+      return tap?.setPaused ? await tap.setPaused(paused) : false;
+    }, paused);
+    const signalSink = signalRecorder ? {
+      captureFrame: (frame: Parameters<typeof signalRecorder.sink.captureFrame>[0]) => { if (controls.retain()) signalRecorder.sink.captureFrame(frame); },
+      captureHint: (hint: Parameters<NonNullable<typeof signalRecorder.sink.captureHint>>[0]) => { if (controls.retain()) signalRecorder.sink.captureHint?.(hint); },
+    } : undefined;
+    let completeRoom = false;
+    let expectedVisualRoom = '';
+    const presentation = createMeetingPresentation(sess.page, () => speak.roomRevision(), () => completeRoom, () => expectedVisualRoom);
     let presenceAt = 0;
     const presence = (ids: string[], names: Record<string, string>, complete: boolean): void => {
       const changed = speak.presence(ids, complete);
+      completeRoom = complete;
+      expectedVisualRoom = JSON.stringify({ ids: [...new Set(ids)].sort(), complete });
+      if (changed || !complete) void presentation.stop();
       if (!changed && Date.now() - presenceAt < 2000) return;
       presenceAt = Date.now();
       void transcriptClient.publish(`tc:meeting:${meetingId}:mutable`, JSON.stringify({
@@ -259,15 +286,35 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
-      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, presence, speak.activity),
-      startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
+      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalSink, publishChat, presence, speak.activity),
+      startRecording: rec ? () => startRecording(sess.page, inv, rec, controls.retain) : undefined,          // MediaRecorder → recording.v1
       engine: bp,
       onFault: (stage, e) => {
         console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
       },
     });
     // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
-    acts = teeActs(liveActs, voiceHandler(speak));
+    acts = teeActs(liveActs, async act => {
+      if (act.action === 'meeting_control' && !inv.voiceAgentEnabled) return;
+      await controls.handle(act);
+      if (act.action === 'meeting_control') return;
+      if (act.action === 'avatar_reset' || (act.action === 'avatar_set' && act.url === 'voxai:default')) {
+        const enabled = act.action === 'avatar_set';
+        await sess.page.evaluate(enabled => {
+          const w = globalThis as any;
+          w.__vexaMeetingVisuals?.avatar(enabled);
+          const controls = Array.from<any>(w.document.querySelectorAll('button,[role="button"]'));
+          const target = controls.find(node => node.getClientRects().length && (enabled ? /turn on camera/i : /turn off camera/i).test(node.getAttribute('aria-label') || ''));
+          target?.click();
+        }, enabled);
+        return;
+      }
+      if (act.action === 'presentation_show') { await presentation.show(act); return; }
+      if (act.action === 'presentation_stop') { await presentation.stop(act.sequence); return; }
+      if (act.action === 'screen_stop' || act.action === 'leave') { await presentation.stop(); return; }
+      if (controls.muted() && ['speak', 'speak_stream', 'speak_audio'].includes(act.action)) return;
+      await voiceHandler(speak)(act);
+    });
   } catch (e) {
     console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);
     join = noBrowserJoinDriver(String(e));
