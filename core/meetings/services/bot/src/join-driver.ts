@@ -136,6 +136,14 @@ export async function readGoogleRoomOccupancy(page: Page): Promise<'alone' | 'oc
     const g = globalThis as any;
     const state = g.__vexaGmeetSpeakers?.getState?.();
     const snapshot = g.__vexaRoomSnapshot?.();
+    // Meet's post-call screen (2026-09-01 incident: the bot sat there 80 minutes). No tiles at all plus
+    // Meet's own ended/left wording is positive evidence the room is gone, not a failed read.
+    const bodyText = String(g.document?.body?.innerText ?? '');
+    const noTiles = !state || !Array.isArray(state.tiles) || state.tiles.length === 0;
+    if (noTiles && /(You left the meeting|Meeting ended|Call ended|The call has ended|Return to home screen)/.test(bodyText)
+        && !/(Ask to join|Asking to be let in|waiting for (the host|someone) to let you in)/i.test(bodyText)) {
+      return 'alone';
+    }
     if (!state || !Array.isArray(state.tiles)) return 'unknown';
     const tiles = new Map<string, boolean>();
     for (const tile of state.tiles) {
