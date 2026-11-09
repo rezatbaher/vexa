@@ -37,6 +37,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   data-asset recording-blob [writers: bot, meeting-api]
   data-asset userdata-blob [writers: remote-browser, bot]
   contract acts.v2
+  contract acts.v3
   contract room-presence.v1
 
 system agent  # copilot; owns the processed (cleaned) transcript + signals

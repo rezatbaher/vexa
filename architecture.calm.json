@@ -1217,6 +1217,18 @@
    ]
   },
   {
+   "unique-id": "acts.v3",
+   "node-type": "contract",
+   "name": "acts.v3",
+   "description": "Revisioned meeting controls and applied-state acknowledgements",
+   "metadata": [
+    {
+     "path": "core/meetings/contracts/acts.v3",
+     "domain": "meetings"
+    }
+   ]
+  },
+  {
    "unique-id": "meeting-speech",
    "node-type": "service",
    "name": "meeting-speech",
@@ -1343,6 +1355,7 @@
       "recording-blob",
       "userdata-blob",
       "acts.v2",
+      "acts.v3",
       "room-presence.v1"
      ]
     }
