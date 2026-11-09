@@ -164,6 +164,46 @@ def test_post_bots_201(monkeypatch):
     assert r.json()["status"] == "requested"
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_failed_runtime_launch_is_not_reported_as_a_join(monkeypatch, cleanup_fails):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.example.test")
+
+    class FailedStart(FakeRuntimeClient):
+        async def create_workload(self, spec):
+            self.specs.append(spec)
+            return {"workloadId": spec["workloadId"], "state": "stopped", "stopReason": "start_failed"}
+
+        async def delete_workload(self, workload_id):
+            if cleanup_fails:
+                raise SpawnFailed("private substrate details")
+            await super().delete_workload(workload_id)
+
+    repo, runtime = InMemoryMeetingRepo(), FailedStart()
+    client = _client(repo, runtime)
+    response = client.post("/bots", headers=HEADERS,
+                           json={"platform": "google_meet", "native_meeting_id": "abc-defg-hij"})
+    assert response.status_code == 502
+    assert "could not start" in response.json()["detail"]
+    assert "private substrate details" not in response.text
+    assert len(runtime.specs) == 1
+    assert len(repo.sessions) == 1
+    row = repo._meetings[repo.sessions[0]["meeting_id"]]
+    assert row["bot_container_id"] == runtime.specs[0]["workloadId"]
+    if cleanup_fails:
+        assert row["status"] == "requested"
+        assert "cleanup is still being checked" in response.json()["detail"]
+        duplicate = client.post("/bots", headers=HEADERS,
+                                json={"platform": "google_meet", "native_meeting_id": "abc-defg-hij"})
+        assert duplicate.status_code == 409
+        assert len(runtime.specs) == 1
+    else:
+        assert runtime.deleted == [runtime.specs[0]["workloadId"]]
+        assert row["status"] == "failed"
+        assert row["data"]["completion_reason"] == "join_failure"
+        assert row["data"]["failure_stage"] == "requested"
+
+
 def test_post_bots_409_on_duplicate(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")

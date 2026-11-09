@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from runtime_kernel import Runtime
 from runtime_kernel.api import create_app
+from runtime_kernel.docker_backend import DockerBackend
+from runtime_kernel.profiles import Runnable
 
 
 def test_health_ok_when_dependencies_reachable():
@@ -50,3 +52,41 @@ def test_health_503_when_store_unreachable():
     r = client.get("/health")
     assert r.status_code == 503
     assert r.json()["checks"]["store"] is False
+
+
+def test_configured_bot_image_is_checked_on_every_health_request(monkeypatch):
+    from types import SimpleNamespace
+
+    backend = DockerBackend()
+    available = False
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return SimpleNamespace(status_code=200 if available else 404)
+
+    monkeypatch.setattr(backend, "_req", request)
+    rt = Runtime(backend=backend, profiles={"meeting-bot": Runnable(image="vexaai/bot:release")})
+    client = TestClient(create_app(rt))
+    missing = client.get("/health")
+    assert missing.status_code == 503
+    assert missing.json()["checks"]["meeting_bot_image"] is False
+    available = True
+    restored = client.get("/health")
+    assert restored.status_code == 200
+    assert restored.json()["checks"]["meeting_bot_image"] is True
+    assert calls == [("GET", "/images/vexaai%2Fbot%3Arelease/json", {"timeout": 3})] * 2
+
+
+def test_bot_image_probe_errors_degrade_health_without_disclosing_details(monkeypatch):
+    backend = DockerBackend()
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("private connection details")
+
+    monkeypatch.setattr(backend, "_req", unavailable)
+    rt = Runtime(backend=backend, profiles={"meeting-bot": Runnable(image="bot:release")})
+    response = TestClient(create_app(rt)).get("/health")
+    assert response.status_code == 503
+    assert response.json()["checks"]["meeting_bot_image"] is False
+    assert "private connection details" not in response.text

@@ -51,7 +51,12 @@ def _default_health_checks(rt: Runtime) -> dict[str, HealthCheck]:
         except Exception:
             return False
 
-    return {"backend": backend_ok, "store": store_ok}
+    checks = {"backend": backend_ok, "store": store_ok}
+    bot = rt.profiles.get("meeting-bot")
+    image_available = getattr(rt.backend, "image_available", None)
+    if bot and bot.runnable.image and callable(image_available):
+        checks["meeting_bot_image"] = lambda: image_available(bot.runnable.image)
+    return checks
 
 
 def create_app(
@@ -108,8 +113,9 @@ def create_app(
             status = rt.create(spec)
             # SYSTEM event: a workload was spawned for the calling control-plane request.
             log_event(
-                "workload_spawned",
+                "workload_start_failed" if status.stopReason == StopReason.start_failed else "workload_spawned",
                 audience="system",
+                level="error" if status.stopReason == StopReason.start_failed else "info",
                 span="workloads.create",
                 fields={"workload_id": spec.workloadId, "profile": spec.profile},
             )

@@ -131,6 +131,11 @@ class DockerBackend:
         r = self._req("GET", f"/images/{ref}/json")
         return r.status_code == 200
 
+    def image_available(self, ref: str) -> bool:
+        """Read-only readiness check; never pull or spawn a workload."""
+        r = self._req("GET", f"/images/{quote(ref, safe='')}/json", timeout=3)
+        return r.status_code == 200
+
     def ensure_worker_image(self, target: str) -> str:
         """Ensure ``target`` (the agent-worker image) is PRESENT on the daemon, PULLING it from its
         registry when absent. The daemon's create API never implicit-pulls, and the compose

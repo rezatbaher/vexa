@@ -514,6 +514,9 @@ async def request_bot(
             f"post-spawn DB write failed; workload {workload_id} torn down"
         ) from e
 
+    if result.get("state") == "stopped" and result.get("stopReason") == "start_failed":
+        await _settle_failed_start(repo, runtime, workload_id, connection_id)
+
     # Reconcile a stop that RACED the spawn (the spawn/stop design-gap fix): if a DELETE marked this
     # meeting stopping/terminal while the workload was being created, tear the just-spawned workload down
     # now — otherwise it boots, joins, and never receives the (already-published) leave command → orphan.
@@ -544,3 +547,19 @@ async def request_bot(
         },
     )
     return _meeting_response(row, sessions=sessions)
+
+
+async def _settle_failed_start(repo, runtime, workload_id: str, connection_id: str) -> None:
+    """Close a confirmed failed launch only after its substrate is reclaimed."""
+    try:
+        await runtime.delete_workload(workload_id)
+    except Exception as exc:  # noqa: BLE001 — an unconfirmed teardown keeps the reservation
+        raise SpawnFailed("The meeting bot could not start; cleanup is still being checked.") from exc
+    await repo.update_meeting_status(
+        session_uid=connection_id,
+        status="failed",
+        completion_reason="join_failure",
+        failure_stage="requested",
+        data={"last_error": {"reason": "The meeting bot could not start. Contact an administrator."}},
+    )
+    raise SpawnFailed("The meeting bot could not start. Contact an administrator.")
