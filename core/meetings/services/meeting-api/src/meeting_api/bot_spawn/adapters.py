@@ -208,6 +208,9 @@ class SqlAlchemyMeetingRepo:
                 merged["failure_stage"] = failure_stage
             for k, v in (data or {}).items():
                 merged[k] = v
+            if (status == "failed" and failure_stage == "requested"
+                    and completion_reason == "join_failure" and merged.get("stop_requested")):
+                merged["completion_reason"] = "stopped"
             if status in ("completed", "failed"):
                 # Delivery marker (#807): `completed` alone means "the bot exited cleanly" — it says
                 # nothing about whether a transcript exists. Persisting the segment count at the

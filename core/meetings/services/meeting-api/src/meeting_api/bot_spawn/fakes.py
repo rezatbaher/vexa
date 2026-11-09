@@ -240,6 +240,9 @@ class InMemoryMeetingRepo:
             row["data"]["failure_stage"] = failure_stage
         for k, v in (data or {}).items():
             row["data"][k] = v
+        if (status == "failed" and failure_stage == "requested"
+                and completion_reason == "join_failure" and row["data"].get("stop_requested")):
+            row["data"]["completion_reason"] = "stopped"
         return dict(row)
 
     async def count_active_bots(self, *, user_id, exclude_meeting_id=None) -> int:

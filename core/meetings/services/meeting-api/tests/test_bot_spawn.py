@@ -230,6 +230,33 @@ def test_failed_start_status_write_error_is_safe_and_keeps_the_reservation(monke
     assert len(runtime.specs) == 1
 
 
+def test_stop_during_failed_launch_cleanup_preserves_user_intent(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.example.test")
+    repo = InMemoryMeetingRepo()
+
+    class StopRacingFailedStart(FakeRuntimeClient):
+        async def create_workload(self, spec):
+            self.specs.append(spec)
+            return {"workloadId": spec["workloadId"], "state": "stopped", "stopReason": "start_failed"}
+
+        async def delete_workload(self, workload_id):
+            session = repo.sessions[-1]
+            await repo.update_meeting_status(session_uid=session["session_uid"],
+                                             status="requested", data={"stop_requested": True})
+            await super().delete_workload(workload_id)
+
+    runtime = StopRacingFailedStart()
+    response = _client(repo, runtime).post("/bots", headers=HEADERS,
+                          json={"platform": "google_meet", "native_meeting_id": "abc-defg-hij"})
+    assert response.status_code == 502
+    row = repo._meetings[repo.sessions[0]["meeting_id"]]
+    assert row["status"] == "failed"
+    assert row["data"]["stop_requested"] is True
+    assert row["data"]["completion_reason"] == "stopped"
+    assert len(runtime.specs) == len(runtime.deleted) == 1
+
+
 def test_post_bots_409_on_duplicate(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")

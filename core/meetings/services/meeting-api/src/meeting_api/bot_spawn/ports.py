@@ -139,7 +139,10 @@ class MeetingRepo(Protocol):
         ``meeting.data`` without a second read), or ``None`` for an unknown session. Set
         ``status`` and merge ``completion_reason`` / ``failure_stage`` + the receiver's forensics into
         ``meeting.data`` JSONB. Maps ``session_uid`` (== the bot's ``connectionId``) → meeting via
-        ``meeting_sessions``; a no-op for an unknown session (e.g. a self-host bot). So the live FSM is
+        ``meeting_sessions``; a no-op for an unknown session (e.g. a self-host bot).
+        ``stop_requested`` must win over a requested-stage ``join_failure`` under the same
+        write lock, preserving a concurrent user's Stop as ``completion_reason=stopped``.
+        So the live FSM is
         DURABLE + QUERYABLE (``GET /meetings`` reflects it, survives a restart) — not only the
         in-process ``MeetingStore``."""
         ...
