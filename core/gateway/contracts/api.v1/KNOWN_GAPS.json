@@ -20,12 +20,6 @@
   "known_gaps": [
     {
       "method": "POST",
-      "path": "/bots/{platform}/{native_meeting_id}/chat",
-      "reason": "No bot-command (send-to-meeting) backend in the 0.12 core — same class as /speak and /config, which also lack a downstream handler. Chat frames flow live over the WS va:*:chat channel; there is no REST send. Registering a 200 that does nothing would fake the capability, so the send half is left unimplemented and recorded here.",
-      "issue": "https://github.com/Vexa-ai/vexa/issues/579"
-    },
-    {
-      "method": "POST",
       "path": "/meetings/{meeting_id}/transcribe",
       "reason": "No on-demand re-transcribe orchestration exists in the 0.12 core (transcription is a live-pipeline concern). Left unimplemented + recorded rather than faked.",
       "issue": "https://github.com/Vexa-ai/vexa/issues/591"
@@ -40,24 +34,6 @@
       "method": "DELETE",
       "path": "/bots/{platform}/{native_meeting_id}/avatar",
       "reason": "Bot-command channel (clear avatar) — live acts.v1 PUBLISH, no downstream handler in the 0.12 carve (voice/media-agent carve).",
-      "issue": "https://github.com/Vexa-ai/vexa/issues/591"
-    },
-    {
-      "method": "POST",
-      "path": "/bots/{platform}/{native_meeting_id}/screen",
-      "reason": "Bot-command channel (start screen-share) — live acts.v1 PUBLISH, no downstream handler in the 0.12 carve (voice/media-agent carve).",
-      "issue": "https://github.com/Vexa-ai/vexa/issues/591"
-    },
-    {
-      "method": "DELETE",
-      "path": "/bots/{platform}/{native_meeting_id}/screen",
-      "reason": "Bot-command channel (stop screen-share) — live acts.v1 PUBLISH, no downstream handler in the 0.12 carve (voice/media-agent carve).",
-      "issue": "https://github.com/Vexa-ai/vexa/issues/591"
-    },
-    {
-      "method": "DELETE",
-      "path": "/bots/{platform}/{native_meeting_id}/speak",
-      "reason": "Bot-command channel (stop TTS) — live acts.v1 PUBLISH, no downstream handler in the 0.12 carve. The POST /speak counterpart IS forwarded by the gateway but likewise has no backend; the DELETE (stop) half is not even registered.",
       "issue": "https://github.com/Vexa-ai/vexa/issues/591"
     },
     {

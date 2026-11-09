@@ -5,3 +5,7 @@ retains the active reservation and blocks another bot. Runtime health checks
 verify that the configured meeting-bot image is present on Docker without pulling
 or launching anything; a missing image or failed probe returns HTTP 503. Runtime
 logs distinguish a failed start from a spawned workload without exposing configuration.
+
+The API exception ledger no longer waives the four chat, screen and speech-stop
+routes already implemented by this fork. Their existing conformance check now
+tests them as implemented routes; published schemas and seals are unchanged.
