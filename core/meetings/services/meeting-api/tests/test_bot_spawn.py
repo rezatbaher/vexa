@@ -204,6 +204,32 @@ def test_failed_runtime_launch_is_not_reported_as_a_join(monkeypatch, cleanup_fa
         assert row["data"]["failure_stage"] == "requested"
 
 
+def test_failed_start_status_write_error_is_safe_and_keeps_the_reservation(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.example.test")
+
+    class BrokenStatusWrite(InMemoryMeetingRepo):
+        async def update_meeting_status(self, **kwargs):
+            raise RuntimeError("private database details")
+
+    class FailedStart(FakeRuntimeClient):
+        async def create_workload(self, spec):
+            self.specs.append(spec)
+            return {"workloadId": spec["workloadId"], "state": "stopped", "stopReason": "start_failed"}
+
+    repo, runtime = BrokenStatusWrite(), FailedStart()
+    client = _client(repo, runtime)
+    body = {"platform": "google_meet", "native_meeting_id": "abc-defg-hij"}
+    response = client.post("/bots", headers=HEADERS, json=body)
+    assert response.status_code == 502
+    assert "final status is still being checked" in response.json()["detail"]
+    assert "private database details" not in response.text
+    assert runtime.deleted == [runtime.specs[0]["workloadId"]]
+    assert repo._meetings[repo.sessions[0]["meeting_id"]]["status"] == "requested"
+    assert client.post("/bots", headers=HEADERS, json=body).status_code == 409
+    assert len(runtime.specs) == 1
+
+
 def test_post_bots_409_on_duplicate(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")

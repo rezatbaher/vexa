@@ -555,11 +555,14 @@ async def _settle_failed_start(repo, runtime, workload_id: str, connection_id: s
         await runtime.delete_workload(workload_id)
     except Exception as exc:  # noqa: BLE001 — an unconfirmed teardown keeps the reservation
         raise SpawnFailed("The meeting bot could not start; cleanup is still being checked.") from exc
-    await repo.update_meeting_status(
-        session_uid=connection_id,
-        status="failed",
-        completion_reason="join_failure",
-        failure_stage="requested",
-        data={"last_error": {"reason": "The meeting bot could not start. Contact an administrator."}},
-    )
+    try:
+        await repo.update_meeting_status(
+            session_uid=connection_id,
+            status="failed",
+            completion_reason="join_failure",
+            failure_stage="requested",
+            data={"last_error": {"reason": "The meeting bot could not start. Contact an administrator."}},
+        )
+    except Exception as exc:  # noqa: BLE001 — reconciliation retains the durable reservation
+        raise SpawnFailed("The meeting bot could not start; its final status is still being checked.") from exc
     raise SpawnFailed("The meeting bot could not start. Contact an administrator.")
