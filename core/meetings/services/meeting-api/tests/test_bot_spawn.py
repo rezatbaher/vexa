@@ -1315,3 +1315,14 @@ async def test_spawn_threads_capture_signal_from_bot_context(monkeypatch, ctx, e
                       token_secret=SECRET)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
     assert inv["captureSignalEnabled"] is expected
+
+
+def test_automatic_leave_retains_the_fork_resource_budget_limit(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.example.test")
+    runtime = FakeRuntimeClient()
+    response = _client(runtime=runtime).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "bounded-leave",
+        "automatic_leave": {"max_time_left_alone": 6 * 60 * 60 * 1000 + 1},
+    })
+    assert response.status_code == 422
+    assert runtime.specs == []

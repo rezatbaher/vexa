@@ -145,8 +145,8 @@ def _resolve_automatic_leave(value: Optional[object]) -> dict:
             raw = value.get(legacy)
         if raw is None:
             return None
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-            raise HTTPException(status_code=422, detail=f"automatic_leave.{primary} must be a positive integer")
+        if isinstance(raw, bool) or not isinstance(raw, int) or not 0 < raw <= 6 * 60 * 60 * 1000:
+            raise HTTPException(status_code=422, detail=f"automatic_leave.{primary} must be a positive integer no greater than six hours")
         return raw
 
     waiting_room = timeout("max_wait_for_admission", "waiting_room_timeout") or lobby_budget_ms()
