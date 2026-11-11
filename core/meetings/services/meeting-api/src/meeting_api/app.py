@@ -132,6 +132,7 @@ def create_app(
     # calendar-sync user edges (async callables from the composition root; None → routes 503)
     calendar_sync_now: Optional["object"] = None,
     calendar_sync_status: Optional["object"] = None,
+    pathwarden_extension: bool = True,
 ) -> FastAPI:
     """Build the unified meeting-api app from the injected ports.
 
@@ -195,8 +196,8 @@ def create_app(
     app.include_router(build_stop_router(meeting_repo, command_publisher, runtime))
 
     # --- voice agent: speak/chat/screen → publish acts to bot_commands (Pathwarden add) ---
-    from .lifecycle.voice_router import build_voice_router
-    app.include_router(build_voice_router(meeting_repo, command_publisher))
+    from .lifecycle.extension import build_extension_router
+    app.include_router(build_extension_router(meeting_repo, command_publisher, enabled=pathwarden_extension))
 
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---
     if transcript_store is None:

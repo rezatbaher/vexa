@@ -23,7 +23,7 @@
  * lazy redis connect.
  */
 import { createClient } from 'redis';
-import { createMeetingPresentation } from './meeting-presentation.js';
+import { createPathwardenExtension } from './pathwarden-extension.js';
 import { createMeetingControl } from './meeting-control.js';
 import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, whisperStreamingFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent } from './contracts.js';
@@ -118,19 +118,6 @@ function teeActs(source: ActsSource, voice: (act: Act) => void | Promise<void>):
   };
 }
 
-/** The bot's voice-act handler: route acts.v1 speak / speak_stop / chat_send to the
- *  SpeakController. The remaining voice acts (screen/avatar) are still out of scope — meeting-api
- *  publishes them, but the bot has no handler, so they are silently dropped here. */
-function voiceHandler(speak: SpeakController): (act: Act) => Promise<void> {
-  return async (act) => {
-    if (act.action === 'speak') await speak.speak(act.text, act.voice);
-    else if (act.action === 'speak_stream') await speak.stream(act.speech_id, act.stream_token);
-    else if (act.action === 'chat_stream') await speak.chatStream(act.speech_id, act.stream_token);
-    else if (act.action === 'speak_stop') await speak.stop();
-    else if (act.action === 'chat_send') await speak.sendChat(act.text);
-  };
-}
-
 /**
  * Probe the SECONDARY control-plane channel (redis) for the reachability gate (#530). A fresh,
  * short-lived connection with a bounded connect timeout and NO reconnection — a single yes/no on
@@ -200,6 +187,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // Browser-launch failure must NOT crash the root: fall back to the no-browser drivers so the
   // orchestrator still emits a clean terminal failed(join_failure).
   let session: BrowserSession | null = null;
+  let extension: ReturnType<typeof createPathwardenExtension> | undefined;
   let join: JoinDriver;
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
@@ -247,21 +235,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       captureFrame: (frame: Parameters<typeof signalRecorder.sink.captureFrame>[0]) => { if (controls.retain()) signalRecorder.sink.captureFrame(frame); },
       captureHint: (hint: Parameters<NonNullable<typeof signalRecorder.sink.captureHint>>[0]) => { if (controls.retain()) signalRecorder.sink.captureHint?.(hint); },
     } : undefined;
-    let completeRoom = false;
-    let expectedVisualRoom = '';
-    const presentation = createMeetingPresentation(sess.page, () => speak.roomRevision(), () => completeRoom, () => expectedVisualRoom);
-    let presenceAt = 0;
-    const presence = (ids: string[], names: Record<string, string>, complete: boolean): void => {
-      const changed = speak.presence(ids, complete);
-      completeRoom = complete;
-      expectedVisualRoom = JSON.stringify({ ids: [...new Set(ids)].sort(), complete });
-      if (changed || !complete) void presentation.stop();
-      if (!changed && Date.now() - presenceAt < 2000) return;
-      presenceAt = Date.now();
-      void transcriptClient.publish(`tc:meeting:${meetingId}:mutable`, JSON.stringify({
-        type: 'meeting.presence.v1', meeting: { id: meetingId }, ids, names, complete, revision: speak.roomRevision(), observed_at: new Date().toISOString(),
-      })).catch(() => {});
-    };
+    extension = createPathwardenExtension({ enabled: !!inv.voiceAgentEnabled, page: sess.page, speak, controls,
+      publish: frame => transcriptClient.publish(`tc:meeting:${meetingId}:mutable`, JSON.stringify({ ...frame, meeting: { id: meetingId } })),
+    });
+    const presence = extension.presence;
     // In-meeting chat (jitsi lane) → a transcript.v1 `chat` segment: the sender is the
     // speaker, the wall clock is the timing (epoch seconds, like the audio lanes), and
     // `completed` is immediate — a chat line has no draft phase.
@@ -294,27 +271,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       },
     });
     // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
-    acts = teeActs(liveActs, async act => {
-      if (act.action === 'meeting_control' && !inv.voiceAgentEnabled) return;
-      await controls.handle(act);
-      if (act.action === 'meeting_control') return;
-      if (act.action === 'avatar_reset' || (act.action === 'avatar_set' && act.url === 'voxai:default')) {
-        const enabled = act.action === 'avatar_set';
-        await sess.page.evaluate(enabled => {
-          const w = globalThis as any;
-          w.__vexaMeetingVisuals?.avatar(enabled);
-          const controls = Array.from<any>(w.document.querySelectorAll('button,[role="button"]'));
-          const target = controls.find(node => node.getClientRects().length && (enabled ? /turn on camera/i : /turn off camera/i).test(node.getAttribute('aria-label') || ''));
-          target?.click();
-        }, enabled);
-        return;
-      }
-      if (act.action === 'presentation_show') { await presentation.show(act); return; }
-      if (act.action === 'presentation_stop') { await presentation.stop(act.sequence); return; }
-      if (act.action === 'screen_stop' || act.action === 'leave') { await presentation.stop(); return; }
-      if (controls.muted() && ['speak', 'speak_stream', 'speak_audio'].includes(act.action)) return;
-      await voiceHandler(speak)(act);
-    });
+    acts = teeActs(liveActs, extension.handle);
   } catch (e) {
     console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);
     join = noBrowserJoinDriver(String(e));
@@ -353,6 +310,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // teardown failure must not change the exit code). The orchestrator already stopped the pipeline
     // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
     // path that skipped the orchestrator's teardown. (#593)
+    await extension?.dispose().catch(() => {});
     await pipeline.stop().catch(() => { /* best-effort */ });
     await signalRecorder?.close().catch(() => { /* best-effort */ });
     if (session) await session.close().catch(() => { /* best-effort */ });

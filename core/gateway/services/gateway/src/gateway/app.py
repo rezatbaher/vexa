@@ -315,6 +315,10 @@ def create_app(
     async def create_bot(request: Request):
         return await _forward("POST", _meeting("/bots"), request)
 
+    @app.get("/bots/capabilities")
+    async def bot_capabilities(request: Request):
+        return await _forward("GET", _meeting("/bots/capabilities"), request)
+
     @app.get("/bots/status")
     async def bots_status(request: Request):
         return await _forward("GET", _meeting("/bots/status"), request)

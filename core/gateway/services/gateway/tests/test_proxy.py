@@ -41,6 +41,16 @@ def test_missing_api_key_is_401():
     assert r.json()["detail"] == "Missing API key"
 
 
+def test_extension_capabilities_use_the_authenticated_proxy_boundary():
+    client, downstream = _client()
+    assert client.get("/bots/capabilities").status_code == 401
+    response = client.get("/bots/capabilities", headers={**AUTH, "x-user-id": "999"})
+    assert response.status_code == 200
+    assert downstream.last["headers"]["x-user-id"] == "7"
+    client, _ = _client(authorizer=FakeAuthorizer(user={"user_id": 7, "scopes": ["tx"]}))
+    assert client.get("/bots/capabilities", headers=AUTH).status_code == 403
+
+
 def test_invalid_api_key_is_401():
     client, _ = _client()
     r = client.get("/bots/status", headers={"x-api-key": "nope"})

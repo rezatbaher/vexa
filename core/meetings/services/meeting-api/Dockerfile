@@ -44,6 +44,11 @@ COPY core/meetings/contracts/webhook.v1/webhook.schema.json         ./meetings/c
 COPY core/runtime/contracts/runtime.v1/runtime.schema.json          ./runtime/contracts/runtime.v1/runtime.schema.json
 COPY core/runtime/contracts/schedule.v1/schedule.schema.json        ./runtime/contracts/schedule.v1/schedule.schema.json
 
+ARG VEXA_SOURCE_REVISION
+COPY scripts/build-extension-manifest.py /tmp/build-extension-manifest.py
+COPY core/meetings/services/bot/src/pathwarden-extension.ts /tmp/pathwarden-extension.ts
+RUN python /tmp/build-extension-manifest.py "$VEXA_SOURCE_REVISION" /tmp/pathwarden-extension.ts /app/src/meeting_api/lifecycle/_pathwarden_build.json
+
 EXPOSE 8080
 # python -m meeting_api → create_app(real adapters) + the lifespan-driven background loops.
 CMD ["python", "-m", "meeting_api"]
