@@ -89,8 +89,8 @@ class Runtime:
         return ev
 
     def _persist(self, spec: WorkloadSpec, status: WorkloadStatus) -> None:
-        if network_contract.ENV in spec.env:
-            spec = spec.model_copy(update={"env": {k:v for k,v in spec.env.items() if k != network_contract.ENV}})
+        if any(key in spec.env for key in (network_contract.ENV,network_contract.RESERVATION_ENV,network_contract.NAMESPACE_ENV)):
+            spec = spec.model_copy(update={"env": {k:v for k,v in spec.env.items() if k not in (network_contract.ENV,network_contract.RESERVATION_ENV,network_contract.NAMESPACE_ENV)}})
         self.store.set(WorkloadRecord(spec=spec, status=status, owner=self.owner_resolver(spec)))
 
     def _expire_network(self, workload_id):
@@ -104,9 +104,20 @@ class Runtime:
         if record.status.state not in (RuntimeState.starting, RuntimeState.running) or self.network_sessions.current(workload_id) is None:
             raise ValueError("Personal network session is not active")
         claims = self.network_sessions.authorize(token, self.backend.name)
-        self.backend.network_namespace(claims, workload_id=workload_id)
+        self.backend.network_namespace(claims, workload_id=workload_id if record.status.state==RuntimeState.running else None)
         self.network_sessions.accept(workload_id, claims)
         return {"renewed": True, "expires_at": claims["exp"]}
+
+    def reserve_network(self,token,requester,*,create=False):
+        claims=self.network_sessions.authorize(token,self.backend.name)
+        namespace=self.backend.network_namespace(claims)
+        row=self.network_sessions.reserve(claims,token,requester,namespace,create=create)
+        if row["workload"] and self.network_sessions.current(row["workload"]) is not None:
+            self.renew_network(row["workload"],token)
+        return {"renewed":True,"expires_at":row["claims"]["exp"],**({"ticket":row["ticket"]} if create else {})}
+
+    def seal_network(self,ticket,requester,spec):
+        return {"reservation":self.network_sessions.seal(ticket,requester,spec)}
 
     def _record(self, workload_id: str) -> WorkloadRecord:
         record = self.store.get(workload_id)
@@ -185,6 +196,13 @@ class Runtime:
     # ── runtime.v1 operations ────────────────────────────────────────────────
     def create(self, spec: WorkloadSpec) -> WorkloadStatus:
         network_claims = None
+        reservation=None
+        if network_contract.RESERVATION_ENV in spec.env:
+            if not self.network_sessions.enabled(self.backend.name): raise ValueError("This runtime does not support personal network reservations")
+            if network_contract.ENV in spec.env: raise ValueError("Use exactly one private network authority")
+            reservation=self.network_sessions.consume(spec.env[network_contract.RESERVATION_ENV],spec)
+            network_claims=reservation["claims"]
+            spec=spec.model_copy(update={"env":{**spec.env,network_contract.ENV:reservation["token"],network_contract.NAMESPACE_ENV:reservation["namespace"]}})
         if network_contract.ENV in spec.env:
             network_claims = self.network_sessions.authorize(spec.env[network_contract.ENV], self.backend.name)
             self.backend.network_namespace(network_claims)
@@ -211,7 +229,7 @@ class Runtime:
         if profile is None:
             raise ValueError(f"unknown profile: {spec.profile!r}")
         runnable = profile.runnable
-        if network_contract.ENV in profile.base_env:
+        if any(key in profile.base_env for key in (network_contract.ENV,network_contract.RESERVATION_ENV,network_contract.NAMESPACE_ENV)):
             raise ValueError("Personal network authority must be supplied per workload, never as a profile default")
 
         # Quota check (O-RT-2): reject the N+1th active workload for this owner.

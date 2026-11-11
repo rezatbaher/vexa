@@ -209,6 +209,8 @@ class DockerBackend:
         if network_contract.ENV in env:
             network_claims=network_contract.verify(env[network_contract.ENV],os.getenv(network_contract.PUBLIC_KEY_ENV,""))
             host_config["NetworkMode"]=self.network_namespace(network_claims)
+            if network_contract.NAMESPACE_ENV in env and env[network_contract.NAMESPACE_ENV]!=host_config["NetworkMode"]:
+                raise ValueError("Reserved gateway namespace changed before workload creation")
         network = os.getenv("DOCKER_NETWORK")
         if network and network_claims is None:
             host_config["NetworkMode"] = network
@@ -250,7 +252,7 @@ class DockerBackend:
         if binds:
             host_config["Binds"] = binds
 
-        spawn_env = {key:value for key,value in env.items() if key!=network_contract.ENV}
+        spawn_env = {key:value for key,value in env.items() if key not in (network_contract.ENV,network_contract.RESERVATION_ENV,network_contract.NAMESPACE_ENV)}
         for key in (
             # llm-module dials (provider-agnostic): completion endpoint/credential/model + the
             # harness runner selection. Dispatch-stamped values win (`key not in spawn_env`).

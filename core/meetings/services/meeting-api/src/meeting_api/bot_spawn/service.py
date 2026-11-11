@@ -474,6 +474,7 @@ async def request_bot(
     """
     from . import network_session
     network_claims = await network_session.authorize(network_lease, runtime, platform, native_meeting_id) if network_lease is not None else None
+    network_reservation = await runtime.reserve_network(network_lease,str(user_id),create=True) if network_claims else None
     authority = authority or AllowAllServiceAuthority()
     # 1. URL.
     constructed_url = meeting_url or construct_meeting_url(
@@ -837,9 +838,9 @@ async def request_bot(
         invocation=invocation,
         callback_url=f"{meeting_api_url}/runtime/callback",
     )
-    if network_claims:
-        spec["env"][network_session.contract.ENV] = network_lease
     try:
+        if network_claims:
+            spec["env"][network_session.contract.RESERVATION_ENV] = await runtime.seal_network(network_reservation["ticket"],str(user_id),spec)
         result = await runtime.create_workload(spec)
         # Defense in depth at the service/port seam (#718 C2): the adapter already refuses a dead
         # spawn (non-201, or a 201 whose body is state=stopped/destroyed), but the service must not

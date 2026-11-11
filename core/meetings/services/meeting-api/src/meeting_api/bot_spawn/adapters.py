@@ -968,7 +968,7 @@ class HttpRuntimeClient:
     async def network_capability(self):
         try:
             response = await self._client.get(f"{self._url}/health", timeout=3.0)
-            return response.json().get("network_session") if response.status_code == 200 else None
+            return response.json().get("network_session") if response.status_code in (200,503) else None
         except Exception:
             return None
 
@@ -977,6 +977,17 @@ class HttpRuntimeClient:
         if response.status_code != 200:
             raise SpawnFailed("Runtime network lease renewal was refused")
         return response.json()
+
+    async def reserve_network(self, token, requester, *, create=False):
+        response=await self._client.post(f"{self._url}/network-sessions/lease",json={"token":token,"requester":str(requester),"create":create},timeout=5.0)
+        if response.status_code==404: raise WorkloadUnknown("network reservation")
+        if response.status_code!=200: raise SpawnFailed("Runtime provisional network authority was refused")
+        return response.json()
+
+    async def seal_network(self,ticket,requester,spec):
+        response=await self._client.post(f"{self._url}/network-sessions/seal",json={"ticket":ticket,"requester":str(requester),"spec":spec},timeout=5.0)
+        if response.status_code!=200: raise SpawnFailed("Runtime network reservation could not bind the selected workload")
+        return response.json()["reservation"]
 
     async def delete_workload(self, workload_id: str) -> None:
         """Tear down a workload (``DELETE /workloads/{id}``) — teardown must be CONFIRMED.

@@ -153,6 +153,22 @@ def create_app(
     def list_workloads():
         return [dump(s) for s in rt.list()]
 
+    @app.post("/network-sessions/lease")
+    def reserve_network(body: dict):
+        try:
+            return rt.reserve_network(body.get("token"),body.get("requester"),create=body.get("create") is True)
+        except KeyError:
+            raise HTTPException(status_code=404,detail="unknown network reservation") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409,detail=str(exc)) from None
+
+    @app.post("/network-sessions/seal")
+    def seal_network(body: dict):
+        try:
+            return rt.seal_network(body.get("ticket"),body.get("requester"),WorkloadSpec.model_validate(body.get("spec")))
+        except ValueError as exc:
+            raise HTTPException(status_code=409,detail=str(exc)) from None
+
     @app.post("/workloads/{workload_id}/network-lease")
     def renew_network(workload_id: str, body: dict):
         try:
