@@ -21,3 +21,6 @@ The consumed ticket may touch only its exact already-starting/running workload w
 A completed Docker rejection plus a confirmed absent container burns that attempt's ticket but
 permits a new ticket for an explicit later attempt under the same unexpired signed session. Timeouts
 and uncertain delivery remain fenced; renewing authority never respawns a bot.
+Profile and quota refusals do not consume a never-submitted ticket. A known store/event failure
+before any Docker request burns that attempt only; an explicit retry repairs its partial starting
+record before quota checks. This does not reclassify a Docker delivery timeout as a safe retry.

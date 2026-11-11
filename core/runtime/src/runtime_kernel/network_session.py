@@ -114,7 +114,7 @@ class NetworkSessions:
                 {"ticket": ticket, "requester": requester}, separators=(",", ":")
             )
 
-    def consume(self, envelope, spec, *, touch=False):
+    def consume(self, envelope, spec, *, touch=False, commit=True):
         try:
             value = json.loads(envelope)
         except (TypeError, ValueError):
@@ -132,7 +132,8 @@ class NetworkSessions:
                 )
             if row["consumed"] and not touch:
                 raise ValueError("The private network ticket has already been consumed")
-            row["consumed"] = True
+            if commit:
+                row["consumed"] = True
             return dict(row)
 
     def _ticket(self, ticket, requester):
@@ -227,11 +228,16 @@ class NetworkSessions:
             for session, row in list(self._reservations.items()):
                 if row["workload"] == workload_id:
                     self._tickets.pop(row["ticket"], None)
-                    if failed_start and active and active["exp"] > self._clock():
+                    authority = active or row["claims"]
+                    if failed_start and authority["exp"] > self._clock():
                         # A failed creation attempt burns its ticket, while the still-authorized
                         # sticky session can issue a new ticket for an explicit later attempt.
                         row.update(
-                            ticket=None, workload=None, digest=None, consumed=False
+                            ticket=None,
+                            workload=None,
+                            digest=None,
+                            consumed=False,
+                            failed_attempt=workload_id,
                         )
                     else:
                         self._reservations.pop(session)

@@ -204,12 +204,20 @@ class Runtime:
         if network_contract.RESERVATION_ENV in spec.env:
             if not self.network_sessions.enabled(self.backend.name): raise ValueError("This runtime does not support personal network reservations")
             if network_contract.ENV in spec.env: raise ValueError("Use exactly one private network authority")
-            reservation=self.network_sessions.consume(spec.env[network_contract.RESERVATION_ENV],spec,touch=existing is not None and existing.state in (RuntimeState.starting,RuntimeState.running))
+            reservation=self.network_sessions.consume(spec.env[network_contract.RESERVATION_ENV],spec,touch=existing is not None and existing.state in (RuntimeState.starting,RuntimeState.running),commit=False)
             network_claims=reservation["claims"]
             spec=spec.model_copy(update={"env":{**spec.env,network_contract.ENV:reservation["token"],network_contract.NAMESPACE_ENV:reservation["namespace"]}})
         if network_contract.ENV in spec.env:
             network_claims = self.network_sessions.authorize(spec.env[network_contract.ENV], self.backend.name)
             self.backend.network_namespace(network_claims)
+        if reservation and reservation.get("failed_attempt") and self.network_sessions.current(reservation["failed_attempt"]) is None:
+            failed_id=reservation["failed_attempt"]
+            failed=self.store.get(failed_id)
+            if failed and failed.status.state==RuntimeState.starting:
+                terminal=failed.status.model_copy(update={"state":RuntimeState.stopped,"stopReason":StopReason.start_failed,"stoppedAt":_now()})
+                self._persist(failed.spec,terminal)
+            if failed_id==spec.workloadId:
+                existing=None
         # runtime.v1: workloadId is the caller-assigned IDEMPOTENCY KEY (ADR 0027). A create for a
         # workload that is still starting/running is a TOUCH — return the live status unchanged: no
         # respawn (the docker backend's name-conflict path would force-delete the RUNNING container,
@@ -242,8 +250,18 @@ class Runtime:
             workloadId=spec.workloadId, profile=spec.profile,
             state=RuntimeState.starting, backend=self.backend.name,
         )
-        self._persist(spec, status)
-        self._emit(spec.workloadId, RuntimeState.starting)
+        if reservation:
+            reservation=self.network_sessions.consume(spec.env[network_contract.RESERVATION_ENV],spec)
+            network_claims=reservation["claims"]
+            spec=spec.model_copy(update={"env":{**spec.env,network_contract.ENV:reservation["token"],network_contract.NAMESPACE_ENV:reservation["namespace"]}})
+        try:
+            self._persist(spec, status)
+            self._emit(spec.workloadId, RuntimeState.starting)
+        except Exception:
+            # No backend request has been submitted. A partial store write is repairable on an
+            # explicit later attempt; no uncertainty can hide a live container at this point.
+            self.network_sessions.remove(spec.workloadId,failed_start=True)
+            raise
         try:
             if network_claims is not None:
                 self.network_sessions.accept(spec.workloadId, network_claims)

@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from runtime_kernel import Runtime
-from runtime_kernel.kernel import StartFailed
+from runtime_kernel.kernel import StartFailed, QuotaExceeded
 from runtime_kernel.api import create_app
 from runtime_kernel.docker_backend import DockerBackend, _in_stack_network
 from runtime_kernel.models import WorkloadSpec
@@ -413,6 +413,80 @@ def test_daemon_absence_does_not_make_a_timeout_safe_to_replay():
         backend.start("mtg-rejected", Runnable(image="missing-validation-image"), {})
     assert backend.creation_absent("mtg-rejected", rejected.value)
     assert [method for method, _ in calls] == ["POST", "GET"]
+
+
+def test_quota_rejection_does_not_burn_a_never_submitted_ticket(authority):
+    key, _, claims = authority
+    backend = FakeDocker(claims)
+    rt = Runtime(
+        backend=backend, profiles={"meeting-bot": Runnable(image="test")}, owner_quota=0
+    )
+    plain = WorkloadSpec(workloadId="mtg-quota", profile="meeting-bot", env={})
+    ticket = rt.reserve_network(signed(key, claims), "caller", create=True)["ticket"]
+    envelope = rt.seal_network(ticket, "caller", plain)["reservation"]
+    spec = plain.model_copy(update={"env": {contract.RESERVATION_ENV: envelope}})
+    with pytest.raises(QuotaExceeded):
+        rt.create(spec)
+    assert not any(
+        path.startswith("/containers/create") for _, path, _ in backend.calls
+    )
+    rt.owner_quota = 1
+    try:
+        assert rt.create(spec).state.value == "running"
+        assert (
+            sum(path.startswith("/containers/create") for _, path, _ in backend.calls)
+            == 1
+        )
+    finally:
+        rt.network_sessions.remove(plain.workloadId)
+
+
+@pytest.mark.parametrize("partial_write", [False, True])
+def test_pre_submission_store_failure_allows_explicit_retry_without_stale_starting_record(
+    authority, monkeypatch, partial_write
+):
+    key, _, claims = authority
+    backend = FakeDocker(claims)
+    rt = Runtime(
+        backend=backend, profiles={"meeting-bot": Runnable(image="test")}, owner_quota=1
+    )
+    plain = WorkloadSpec(workloadId="mtg-store-failure", profile="meeting-bot", env={})
+    token = signed(key, claims)
+    ticket = rt.reserve_network(token, "caller", create=True)["ticket"]
+    envelope = rt.seal_network(ticket, "caller", plain)["reservation"]
+    original = rt.store.set
+    failed = False
+
+    def fail_once(record):
+        nonlocal failed
+        if not failed and record.status.state.value == "starting":
+            failed = True
+            if partial_write:
+                original(record)
+            raise RuntimeError("synthetic pre-submission store failure")
+        original(record)
+
+    monkeypatch.setattr(rt.store, "set", fail_once)
+    with pytest.raises(RuntimeError):
+        rt.create(
+            plain.model_copy(update={"env": {contract.RESERVATION_ENV: envelope}})
+        )
+    assert not any(
+        path.startswith("/containers/create") for _, path, _ in backend.calls
+    )
+    replacement = rt.reserve_network(token, "caller", create=True)["ticket"]
+    assert replacement != ticket
+    retry = rt.seal_network(replacement, "caller", plain)["reservation"]
+    try:
+        retried = plain.model_copy(update={"env": {contract.RESERVATION_ENV: retry}})
+        assert rt.create(retried).state.value == "running"
+        assert rt.create(retried).state.value == "running"
+        assert (
+            sum(path.startswith("/containers/create") for _, path, _ in backend.calls)
+            == 1
+        )
+    finally:
+        rt.network_sessions.remove(plain.workloadId)
 
 
 @pytest.mark.parametrize("known_absent", [True, False])
