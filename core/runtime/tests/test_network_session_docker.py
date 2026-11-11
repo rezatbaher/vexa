@@ -66,7 +66,7 @@ def test_real_namespace_inherits_gateway_dns_and_hosts_and_expires(monkeypatch):
             runtime.renew_network(workload, sign({**renewal, "owner": str(uuid.uuid4())}))
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if not backend._req("GET", f"/containers/{bot_name}/json").json()["State"]["Running"]:
+            if not backend._req("GET", f"/containers/{bot_name}/json").json()["State"]["Running"] and runtime.get(workload).state.value == "stopped":
                 break
             time.sleep(0.2)
         else:
