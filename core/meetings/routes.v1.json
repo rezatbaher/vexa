@@ -270,6 +270,20 @@
         "bot",
         "tx"
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/bots/capabilities",
+      "scopes": [
+        "bot"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/bots/{platform}/{native_meeting_id}/chat",
+      "scopes": [
+        "bot"
+      ]
     }
   ]
 }
