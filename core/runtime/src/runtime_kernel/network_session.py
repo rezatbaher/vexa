@@ -88,6 +88,9 @@ class NetworkSessions:
                 raise ValueError("Provisional network session affinity differs")
             if claims["exp"] <= self._clock():
                 raise ValueError("Provisional network authority expired")
+            if create and row["ticket"] is None:
+                row["ticket"] = secrets.token_urlsafe(32)
+                self._tickets[row["ticket"]] = row
             if claims["exp"] > row["claims"]["exp"]:
                 row["claims"], row["token"] = claims, token
             return dict(row)
@@ -111,7 +114,7 @@ class NetworkSessions:
                 {"ticket": ticket, "requester": requester}, separators=(",", ":")
             )
 
-    def consume(self, envelope, spec):
+    def consume(self, envelope, spec, *, touch=False):
         try:
             value = json.loads(envelope)
         except (TypeError, ValueError):
@@ -127,7 +130,7 @@ class NetworkSessions:
                 raise ValueError(
                     "The network ticket does not authorize this workload specification"
                 )
-            if row["consumed"]:
+            if row["consumed"] and not touch:
                 raise ValueError("The private network ticket has already been consumed")
             row["consumed"] = True
             return dict(row)
@@ -215,14 +218,21 @@ class NetworkSessions:
             self._timers.pop(workload_id, None)
         self._expire(workload_id)
 
-    def remove(self, workload_id):
+    def remove(self, workload_id, *, failed_start=False):
         with self._lock:
             timer = self._timers.pop(workload_id, None)
             if timer:
                 timer.cancel()
-            self._active.pop(workload_id, None)
+            active = self._active.pop(workload_id, None)
             for session, row in list(self._reservations.items()):
                 if row["workload"] == workload_id:
-                    self._reservations.pop(session)
                     self._tickets.pop(row["ticket"], None)
-                    self._ended[session] = True
+                    if failed_start and active and active["exp"] > self._clock():
+                        # A failed creation attempt burns its ticket, while the still-authorized
+                        # sticky session can issue a new ticket for an explicit later attempt.
+                        row.update(
+                            ticket=None, workload=None, digest=None, consumed=False
+                        )
+                    else:
+                        self._reservations.pop(session)
+                        self._ended[session] = True

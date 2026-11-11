@@ -17,3 +17,7 @@ requester and exact meeting-bot workload specification, and resolves the latest 
 the workload is created. Changing its caller, profile, environment, workload ID or signed network
 binding fails. Tickets and resolved authority are stripped from worker environments and persisted
 specifications. Expiry or stop invalidates the ticket; late Docker starts are killed.
+The consumed ticket may touch only its exact already-starting/running workload with live authority.
+A completed Docker rejection plus a confirmed absent container burns that attempt's ticket but
+permits a new ticket for an explicit later attempt under the same unexpired signed session. Timeouts
+and uncertain delivery remain fenced; renewing authority never respawns a bot.

@@ -360,6 +360,114 @@ def test_reservation_pins_caller_spec_generation_and_cannot_revive(authority):
         )
 
 
+def test_consumed_ticket_touches_only_its_live_exact_workload(authority):
+    key, _, claims = authority
+    backend = FakeDocker(claims)
+    rt = Runtime(backend=backend, profiles={"meeting-bot": Runnable(image="test")})
+    plain = WorkloadSpec(
+        workloadId="mtg-touch", profile="meeting-bot", env={"SELECTED": "yes"}
+    )
+    ticket = rt.reserve_network(signed(key, claims), "caller", create=True)["ticket"]
+    envelope = rt.seal_network(ticket, "caller", plain)["reservation"]
+    spec = plain.model_copy(
+        update={"env": {**plain.env, contract.RESERVATION_ENV: envelope}}
+    )
+    try:
+        assert rt.create(spec).state.value == "running"
+        assert rt.create(spec).state.value == "running"
+        assert (
+            sum(path.startswith("/containers/create") for _, path, _ in backend.calls)
+            == 1
+        )
+        with pytest.raises(ValueError):
+            rt.create(
+                spec.model_copy(update={"env": {**spec.env, "SELECTED": "different"}})
+            )
+        rt.stop(spec.workloadId)
+        with pytest.raises(ValueError):
+            rt.create(spec)
+        assert (
+            sum(path.startswith("/containers/create") for _, path, _ in backend.calls)
+            == 1
+        )
+    finally:
+        rt.network_sessions.remove(spec.workloadId)
+
+
+def test_daemon_absence_does_not_make_a_timeout_safe_to_replay():
+    backend = DockerBackend()
+    calls = []
+
+    def refused(method, path, **kwargs):
+        calls.append((method, path))
+        return SimpleNamespace(
+            status_code=404, text="synthetic daemon rejection", json=lambda: {}
+        )
+
+    backend._req = refused
+    assert not backend.creation_absent(
+        "mtg-unknown", TimeoutError("delivery uncertain")
+    )
+    assert not calls
+    with pytest.raises(RuntimeError) as rejected:
+        backend.start("mtg-rejected", Runnable(image="missing-validation-image"), {})
+    assert backend.creation_absent("mtg-rejected", rejected.value)
+    assert [method for method, _ in calls] == ["POST", "GET"]
+
+
+@pytest.mark.parametrize("known_absent", [True, False])
+def test_failed_attempt_retries_only_after_confirmed_absence_and_explicit_new_ticket(
+    authority, known_absent
+):
+    key, _, claims = authority
+    backend = FakeDocker(claims)
+    rt = Runtime(backend=backend, profiles={"meeting-bot": Runnable(image="test")})
+    backend.creation_absent = lambda _workload, _failure: known_absent
+    plain = WorkloadSpec(workloadId="mtg-retry", profile="meeting-bot", env={})
+    token = signed(key, claims)
+    ticket = rt.reserve_network(token, "caller", create=True)["ticket"]
+    envelope = rt.seal_network(ticket, "caller", plain)["reservation"]
+    spec = plain.model_copy(update={"env": {contract.RESERVATION_ENV: envelope}})
+    original = backend.start
+    backend.start = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("synthetic daemon creation failure")
+    )
+    with pytest.raises(StartFailed):
+        rt.create(spec)
+    assert not any(
+        path.startswith("/containers/create") for _, path, _ in backend.calls
+    )
+    with pytest.raises(ValueError):
+        rt.create(spec)
+    if not known_absent:
+        with pytest.raises(ValueError):
+            rt.reserve_network(token, "caller", create=True)
+        return
+    assert rt.reserve_network(token, "caller")["renewed"]
+    assert not any(
+        path.startswith("/containers/create") for _, path, _ in backend.calls
+    )
+    fresh = rt.reserve_network(token, "caller", create=True)["ticket"]
+    assert fresh != ticket
+    fresh_envelope = rt.seal_network(fresh, "caller", plain)["reservation"]
+    backend.start = original
+    try:
+        assert (
+            rt.create(
+                plain.model_copy(
+                    update={"env": {contract.RESERVATION_ENV: fresh_envelope}}
+                )
+            ).state.value
+            == "running"
+        )
+        assert (
+            sum(path.startswith("/containers/create") for _, path, _ in backend.calls)
+            == 1
+        )
+    finally:
+        rt.network_sessions.remove(plain.workloadId)
+
+
 @pytest.mark.parametrize("phase", ["admission", "docker"])
 def test_real_slow_start_over_fifteen_seconds_renews_without_stale_jwt(
     authority, phase

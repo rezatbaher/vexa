@@ -32,6 +32,10 @@ _COMPOSE_LABEL = "com.docker.compose.project"
 logger = logging.getLogger("runtime_kernel.docker_backend")
 
 
+class _CreationRejected(RuntimeError):
+    """The daemon completed and rejected creation; this is not an uncertain-delivery timeout."""
+
+
 def _stop_grace_sec() -> int:
     """How long ``terminate`` lets a workload leave gracefully before the daemon SIGKILLs it.
 
@@ -142,6 +146,12 @@ class DockerBackend:
         """Read-only readiness check; never pull or spawn a workload."""
         r = self._req("GET", f"/images/{quote(ref, safe='')}/json", timeout=3)
         return r.status_code == 200
+
+    def creation_absent(self, workload_id: str, failure: Exception) -> bool:
+        """A completed rejection plus daemon 404 permits an explicit fresh attempt."""
+        if not isinstance(failure,_CreationRejected):
+            return False
+        return self._req("GET",f"/containers/{self._cname(workload_id)}/json",timeout=3).status_code==404
 
     def ensure_worker_image(self, target: str) -> str:
         """Ensure ``target`` (the agent-worker image) is PRESENT on the daemon, PULLING it from its
@@ -293,11 +303,14 @@ class DockerBackend:
             self._req("DELETE", f"/containers/{name}?force=true")
             r = self._req("POST", f"/containers/create?name={name}", json=payload)
         if r.status_code not in (200, 201):
-            raise RuntimeError(f"docker create {name} failed ({r.status_code}): {r.text.strip()}")
+            raise _CreationRejected(f"docker create {name} failed ({r.status_code}): {r.text.strip()}")
         cid = r.json().get("Id", name)
 
         s = self._req("POST", f"/containers/{cid}/start")
         if s.status_code not in (204, 304):
+            removed=self._req("DELETE",f"/containers/{cid}?force=true")
+            if removed.status_code in (204,404):
+                raise _CreationRejected(f"docker start {name} failed ({s.status_code})")
             raise RuntimeError(f"docker start {name} failed ({s.status_code}): {s.text.strip()}")
         return WorkloadHandle(id=workload_id, impl=name)
 

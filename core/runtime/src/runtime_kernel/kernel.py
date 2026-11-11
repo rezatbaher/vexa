@@ -195,12 +195,16 @@ class Runtime:
 
     # ── runtime.v1 operations ────────────────────────────────────────────────
     def create(self, spec: WorkloadSpec) -> WorkloadStatus:
+        try:
+            existing=self.get(spec.workloadId)
+        except KeyError:
+            existing=None
         network_claims = None
         reservation=None
         if network_contract.RESERVATION_ENV in spec.env:
             if not self.network_sessions.enabled(self.backend.name): raise ValueError("This runtime does not support personal network reservations")
             if network_contract.ENV in spec.env: raise ValueError("Use exactly one private network authority")
-            reservation=self.network_sessions.consume(spec.env[network_contract.RESERVATION_ENV],spec)
+            reservation=self.network_sessions.consume(spec.env[network_contract.RESERVATION_ENV],spec,touch=existing is not None and existing.state in (RuntimeState.starting,RuntimeState.running))
             network_claims=reservation["claims"]
             spec=spec.model_copy(update={"env":{**spec.env,network_contract.ENV:reservation["token"],network_contract.NAMESPACE_ENV:reservation["namespace"]}})
         if network_contract.ENV in spec.env:
@@ -216,10 +220,6 @@ class Runtime:
         # path, where the backend's stale-name replace reclaims the exited container. `starting` is
         # touched too — the truthful read of a concurrent create mid-spawn; a record crashed stuck
         # in `starting` was already unrecoverable-by-create before this (stop/destroy clears it).
-        try:
-            existing = self.get(spec.workloadId)
-        except KeyError:
-            existing = None
         if existing is not None and existing.state in (RuntimeState.starting, RuntimeState.running):
             if network_claims is not None:
                 self.renew_network(spec.workloadId, spec.env[network_contract.ENV])
@@ -265,7 +265,14 @@ class Runtime:
                 if current is None or current["exp"]<=time.time():
                     raise ValueError("Personal network authority ended during workload start")
         except Exception as exc:
-            self.network_sessions.remove(spec.workloadId)
+            absent=False
+            if network_claims is not None:
+                try:
+                    probe=getattr(self.backend,"creation_absent",None)
+                    absent=bool(probe and probe(spec.workloadId,exc))
+                except Exception:
+                    pass
+            self.network_sessions.remove(spec.workloadId,failed_start=absent)
             if network_claims is not None and spec.workloadId in self._handles:
                 self.backend.kill(self._handles[spec.workloadId])
             # Record the honest terminal state (persist + emit) FIRST — GET /workloads and the
