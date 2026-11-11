@@ -42,7 +42,7 @@ AGENT_ROWS = frozenset({
 #: What shipped. A count, not a copy of the table: a second copy of 67 rows is a second thing to
 #: keep in step, and `test_the_assembled_table_matches_the_app_exactly` is what proves the
 #: CONTENT — against the routes themselves, which is a stronger anchor than a literal.
-FULL_SCOPED, FULL_UNSCOPED = 70, 2
+FULL_SCOPED, FULL_UNSCOPED = 71, 2
 #: What THIS BUILD publishes — the full profile, less the agent rows when the build omits them.
 #: DERIVED, so the count stays exact in either build rather than softening to a range or a
 #: subset check. 67 on the line; 60 in a build with no agent manifest.
@@ -86,8 +86,8 @@ def test_the_assembled_table_matches_the_app_exactly():
 @needs_agent
 def test_every_domain_declares_its_own_and_only_its_own():
     a = routes_manifest.load({"gateway", "meetings", "identity", "mcp", "agent"})
-    # The meeting domain includes the two Pathwarden routes; every domain keeps an exact count.
-    assert a.domains == {"agent": 7, "gateway": 2, "identity": 12, "mcp": 12, "meetings": 39}
+    # The meeting domain includes the Pathwarden routes; every domain keeps an exact count.
+    assert a.domains == {"agent": 7, "gateway": 2, "identity": 12, "mcp": 12, "meetings": 40}
     assert {k for k, d in a.owner_of.items() if d == "agent"} == AGENT_ROWS
     # The EDGE declares two routes and they are its own — /health and /auth/me forward nothing.
     assert {k for k, d in a.owner_of.items() if d == "gateway"} == set(UNSCOPED_ROUTES)
