@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from runtime_kernel import Runtime
 from runtime_kernel.docker_backend import DockerBackend
-from runtime_kernel.models import WorkloadSpec
+from runtime_kernel.models import Resources, WorkloadSpec
 from runtime_kernel.network_session import contract
 from runtime_kernel.profiles import Runnable
 
@@ -49,7 +49,7 @@ def test_real_namespace_inherits_gateway_dns_and_hosts_and_expires(monkeypatch):
         claims = {"aud": "pathwarden-vexa-network", "session": session, "owner": owner, "gateway": gateway, "generation": 1,
                   "workload": {"platform": "google_meet", "native_meeting_id": "isolated-validation"}, "iat": now, "exp": now + 15}
         token = sign(claims)
-        runtime.create(WorkloadSpec(workloadId=workload, profile="network-validation", env={contract.ENV: token}))
+        runtime.create(WorkloadSpec(workloadId=workload, profile="network-validation", env={contract.ENV: token}, resources=Resources(cpu=0.1, memoryMb=64)))
         donor = backend._req("GET", f"/containers/{gateway}/json").json()
         bot = backend._req("GET", f"/containers/{bot_name}/json").json()
         assert bot["State"]["Running"]
