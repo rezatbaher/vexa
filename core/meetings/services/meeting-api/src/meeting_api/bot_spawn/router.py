@@ -274,6 +274,18 @@ def build_router(
     the service already has (``service._bot_name_from_context``)."""
     router = APIRouter()
 
+    @router.post("/bots/{platform}/{native_meeting_id}/network-lease")
+    async def renew_network(platform: str, native_meeting_id: str, request: Request, x_user_id: Optional[str] = Header(default=None)):
+        from .network_session import renew
+        user_id = _resolve_user_id(x_user_id)
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid network renewal") from None
+        if not isinstance(body, dict) or set(body) != {"token"}:
+            raise HTTPException(status_code=422, detail="invalid network renewal")
+        return await renew(repo, runtime, user_id=user_id, platform=platform, native_meeting_id=native_meeting_id, token=body["token"])
+
     @router.post("/bots", status_code=201)
     async def create_bot(
         request: Request,
@@ -301,6 +313,8 @@ def build_router(
             raise HTTPException(status_code=422, detail="invalid JSON body")
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="body must be an object")
+        if "network_lease" in body and (not isinstance(body["network_lease"],str) or not 1<=len(body["network_lease"])<=8192):
+            raise HTTPException(status_code=422,detail="network_lease must be a signed network-session lease")
 
         # A passcode sent under a name we do not read is a credential DROPPED — refuse before any
         # DB, runtime or network work, and name the field that works. Only a NON-EMPTY alias is
@@ -490,6 +504,7 @@ def build_router(
                 # BOT_AUTHENTICATED deployment default (resolve_authenticated).
                 authenticated=body.get("authenticated"),
                 concurrent_authenticated=_resolve_concurrent_authenticated(body.get("concurrent_authenticated")),
+                network_lease=body.get("network_lease") if "network_lease" in body else None,
                 max_concurrent=max_concurrent,
                 webhook_url=x_user_webhook_url,
                 webhook_secret=x_user_webhook_secret,

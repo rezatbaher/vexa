@@ -459,6 +459,7 @@ async def request_bot(
     # the BOT_AUTHENTICATED env default, so a caller that never sends the field is unchanged.
     authenticated: Optional[bool] = None,
     concurrent_authenticated: bool = False,
+    network_lease: Optional[str] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -471,6 +472,8 @@ async def request_bot(
     ``<= 0`` means the quota is DEPLETED (every spawn rejected) — 0 is never "unlimited"; ``None``
     means no cap was provided, so no pre-check.
     """
+    from . import network_session
+    network_claims = await network_session.authorize(network_lease, runtime, platform, native_meeting_id) if network_lease is not None else None
     authority = authority or AllowAllServiceAuthority()
     # 1. URL.
     constructed_url = meeting_url or construct_meeting_url(
@@ -713,6 +716,7 @@ async def request_bot(
                 "recording_enabled": recording_enabled,
                 "transcription_provider": transcription_provider,
                 "service_authority": authority_record,
+                "network_session": network_session.binding(network_claims) if network_claims else None,
             },
         )
     else:
@@ -724,6 +728,8 @@ async def request_bot(
         if transcription_provider is not None:
             meeting_data["transcription_provider"] = transcription_provider
         meeting_data["service_authority"] = authority_record
+        if network_claims:
+            meeting_data["network_session"] = network_session.binding(network_claims)
         # The serialization key for authenticated spawns — find_active_by_userdata matches on it.
         if authenticated and auth_userdata_path:
             meeting_data["auth_userdata_path"] = auth_userdata_path
@@ -831,6 +837,8 @@ async def request_bot(
         invocation=invocation,
         callback_url=f"{meeting_api_url}/runtime/callback",
     )
+    if network_claims:
+        spec["env"][network_session.contract.ENV] = network_lease
     try:
         result = await runtime.create_workload(spec)
         # Defense in depth at the service/port seam (#718 C2): the adapter already refuses a dead

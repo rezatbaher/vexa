@@ -1,0 +1,10 @@
+{
+  "aud": "pathwarden-vexa-network",
+  "session": "11111111-1111-4111-8111-111111111111",
+  "owner": "22222222-2222-4222-8222-222222222222",
+  "gateway": "pathwarden-exit-11111111-1111-4111-8111-111111111111-1",
+  "generation": 1,
+  "workload": {"platform": "google_meet", "native_meeting_id": "abc-defg-hij"},
+  "iat": 1000,
+  "exp": 1015
+}

@@ -96,6 +96,7 @@ SENSITIVE_OMIT_KEYS = frozenset({
 # transcript-share recipient was given a transcript, not the owner's endpoint configuration, and
 # must not be able to enumerate the meeting's other readers.
 OWNER_ONLY_KEYS = frozenset({
+    "network_session",
     # Per-user webhook config, stamped onto the row at spawn so the lifecycle callback can deliver.
     # The endpoint URL and the event filter are the owner's configuration — part of the v0.10 REST
     # contract, and the reason #1243's unconditional strip was a backward-compatibility break.

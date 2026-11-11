@@ -38,6 +38,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install "uvicorn[standard]==0.34.0"
 
 COPY src ./src
+COPY contracts/network-session.v1 ./contracts/network-session.v1
 
 EXPOSE 8090
 # python -m runtime_kernel → uvicorn over create_app(Runtime(DockerBackend(), default_registry())).

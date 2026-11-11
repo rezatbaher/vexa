@@ -89,6 +89,8 @@ class ProcessBackend:
         """``resources`` is accepted and NOT enforced: a child process has no admission gate to
         satisfy, and cgroup limits are the host's concern on this substrate. The enforcement
         boundary is k8s-only and no parity is claimed."""
+        if "VEXA_NETWORK_SESSION" in env:
+            raise ValueError("Personal network sessions require the Docker backend")
         if not runnable.command:
             raise ValueError("process backend requires a command")
         # Workspace mount set (WP-A1.1): the lite/process backend shares the HOST filesystem — there is

@@ -43,6 +43,7 @@ COPY core/meetings/contracts/lifecycle.v1/lifecycle.schema.json     ./meetings/c
 COPY core/meetings/contracts/webhook.v1/webhook.schema.json         ./meetings/contracts/webhook.v1/webhook.schema.json
 COPY core/runtime/contracts/runtime.v1/runtime.schema.json          ./runtime/contracts/runtime.v1/runtime.schema.json
 COPY core/runtime/contracts/schedule.v1/schedule.schema.json        ./runtime/contracts/schedule.v1/schedule.schema.json
+COPY core/runtime/contracts/network-session.v1 ./runtime/contracts/network-session.v1
 
 ARG VEXA_SOURCE_REVISION
 COPY scripts/build-extension-manifest.py /tmp/build-extension-manifest.py

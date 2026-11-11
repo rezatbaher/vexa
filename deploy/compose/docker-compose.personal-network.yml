@@ -1,0 +1,11 @@
+# Apply after docker-compose.yml on the same Docker host as the operator-owned isolated gateways.
+# The gateway owns public TCP/UDP/DNS and narrow configured internal proxies; bots share only its namespace.
+services:
+  runtime:
+    environment:
+      VEXA_NETWORK_SESSION_ENABLED: ${VEXA_NETWORK_SESSION_ENABLED:-false}
+      VEXA_NETWORK_SESSION_PUBLIC_KEY: ${VEXA_NETWORK_SESSION_PUBLIC_KEY:-}
+  meeting-api:
+    environment:
+      VEXA_NETWORK_SESSION_ENABLED: ${VEXA_NETWORK_SESSION_ENABLED:-false}
+      VEXA_NETWORK_SESSION_PUBLIC_KEY: ${VEXA_NETWORK_SESSION_PUBLIC_KEY:-}

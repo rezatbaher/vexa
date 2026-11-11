@@ -517,6 +517,11 @@ def create_app(
     async def bots_status(request: Request):
         return await _forward("GET", _meeting("/bots/status"), request)
 
+    @app.post("/bots/{platform}/{native_meeting_id}/network-lease")
+    async def renew_network(platform: str, native_meeting_id: str, request: Request):
+        from urllib.parse import quote
+        return await _forward("POST", _meeting(f"/bots/{quote(platform, safe='')}/{quote(native_meeting_id, safe='')}/network-lease"), request)
+
     @app.delete("/bots/{platform}/{native_meeting_id}")
     async def stop_bot(platform: str, native_meeting_id: str, request: Request):
         return await _forward("DELETE", _meeting(f"/bots/{platform}/{native_meeting_id}"), request)

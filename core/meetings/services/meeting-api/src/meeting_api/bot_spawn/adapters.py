@@ -965,6 +965,19 @@ class HttpRuntimeClient:
             raise FailedWorkloadStart(body)
         return body
 
+    async def network_capability(self):
+        try:
+            response = await self._client.get(f"{self._url}/health", timeout=3.0)
+            return response.json().get("network_session") if response.status_code == 200 else None
+        except Exception:
+            return None
+
+    async def renew_network(self, workload_id, token):
+        response = await self._client.post(f"{self._url}/workloads/{workload_id}/network-lease", json={"token": token}, timeout=5.0)
+        if response.status_code != 200:
+            raise SpawnFailed("Runtime network lease renewal was refused")
+        return response.json()
+
     async def delete_workload(self, workload_id: str) -> None:
         """Tear down a workload (``DELETE /workloads/{id}``) — teardown must be CONFIRMED.
 

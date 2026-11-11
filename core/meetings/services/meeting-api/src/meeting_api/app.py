@@ -276,7 +276,7 @@ def create_app(
 
     # --- voice agent: speak/chat/screen → publish acts to bot_commands (Pathwarden add) ---
     from .lifecycle.extension import build_extension_router
-    app.include_router(build_extension_router(meeting_repo, command_publisher, enabled=pathwarden_extension))
+    app.include_router(build_extension_router(meeting_repo, command_publisher, enabled=pathwarden_extension, runtime=runtime))
 
     # Resolve the shared recording storage before mounting the collector: completed-meeting erasure
     # uses this same port to delete objects before its transcript/JSONB finalization.

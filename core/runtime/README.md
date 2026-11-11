@@ -35,6 +35,22 @@ uv run pytest -q
 ```
 
 ## Status
+
+### Private personal networking
+
+The default-off `VEXA_NETWORK_SESSION_ENABLED` extension uses the separately sealed
+`network-session.v1` contract and configured Ed25519 public key. An env-carried signed lease is
+validated before spawning, consumed by the Docker adapter and stripped from the worker and stored
+spec. The gateway must be running, isolated with `NetworkMode=none`, use local DNS, and carry matching
+session/owner/generation labels. The workload shares its immutable container namespace and has no
+application-network attachment. Gateway hosts/resolver files preserve the original internal service
+hostnames and TLS identities while approved narrow proxies provide internal STT/TTS/control access.
+
+`POST /workloads/{id}/network-lease` renews the same binding; 15-second expiry stops the workload.
+An expired lease cannot be revived or swapped to another gateway. Runtime restart re-adopts these
+containers in the correct stack scope and stops them because their active authority was not retained.
+The process and Kubernetes backends explicitly reject personal networking. `/health` advertises the
+exact private protocol only for a configured Docker runtime. No public `runtime.v1` schema changed.
 - ✅ delivered — `runtime.v1` lifecycle over process / Docker / K8s backends, with quotas (O-RT-2)
 - ✅ delivered — **workspace tenant isolation, enforced by the substrate on all three backends**
   (`mounts.py` + `isolation.py`): docker = one volume-subpath bind per granted mount (engine ≥ v26 for

@@ -69,3 +69,15 @@ Observe-only sessions are never later reinterpreted as enforced sessions.
 No config means explicit stock OSS allow-all. Once configured, unavailable, malformed, stale, or
 cross-bound decisions fail closed. `mode=observe` records the authority response but cannot satisfy
 a hosted hard-spend-cap claim.
+
+### Private personal network extension
+
+POST /bots accepts an optional signed `network_lease` bound to the exact meeting identity. The
+network-session.v1 verifier and an actual runtime capability probe run before any meeting insertion.
+The lease rides the existing runtime.v1 env map and never reaches the bot. Its public binding is
+stored as owner-only `data.network_session`; the token is absent from meeting projections.
+POST /bots/{platform}/{native_meeting_id}/network-lease refreshes the saved sticky binding, including
+while the runtime response is uncertain by using the eager session's deterministic workload ID.
+Unsupported runtimes, invalid leases, switched owner/session/gateway and expired leases are refused.
+The default-off Compose overlay is docker-compose.personal-network.yml; real joins/media remain an
+explicit rollout acceptance requirement.

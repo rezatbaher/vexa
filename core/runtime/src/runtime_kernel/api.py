@@ -105,6 +105,8 @@ def create_app(
 
         body = {"status": "ok" if healthy else "degraded", "checks": results,
                 "capabilities": capability_health()}
+        from .network_session import contract as network_contract
+        body["network_session"] = network_contract.PROTOCOL if rt.network_sessions.enabled(rt.backend.name) else None
         return JSONResponse(body, status_code=200 if healthy else 503)
 
     @app.post("/workloads", status_code=201)
@@ -150,6 +152,15 @@ def create_app(
     @app.get("/workloads")
     def list_workloads():
         return [dump(s) for s in rt.list()]
+
+    @app.post("/workloads/{workload_id}/network-lease")
+    def renew_network(workload_id: str, body: dict):
+        try:
+            return rt.renew_network(workload_id, body.get("token"))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown workload") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
 
     @app.get("/workloads/{workload_id}")
     def get(workload_id: str):

@@ -13,7 +13,7 @@ from .voice_router import build_voice_router
 BUILD = Path(__file__).with_name("_pathwarden_build.json")
 
 
-def build_extension_router(repo, publisher, *, enabled=True, build_path=BUILD):
+def build_extension_router(repo, publisher, *, enabled=True, build_path=BUILD, runtime=None):
     router = APIRouter()
     wired = set()
     if enabled:
@@ -37,7 +37,9 @@ def build_extension_router(repo, publisher, *, enabled=True, build_path=BUILD):
         required = {"speak_stream", "chat_stream", "meeting_control", "presentation_show", "presentation_stop"}
         voice = ("POST", "/bots/{platform}/{native_meeting_id}/speak") in wired
         compatible = bool(voice and known_build and required <= declared)
+        from ..bot_spawn.network_session import capability
         return {
+            "network_session": await capability(runtime),
             "schema_version": 1,
             "source_revision": source if known_build else None,
             "extension_protocol": "pathwarden-meeting.v1" if compatible else None,

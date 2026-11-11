@@ -1403,6 +1403,18 @@
           "domain": "meetings"
         }
       ]
+    },
+    {
+      "unique-id": "network-session.v1",
+      "node-type": "contract",
+      "name": "network-session.v1",
+      "description": "Private signed personal network namespace lease and renewal contract",
+      "metadata": [
+        {
+          "path": "core/runtime/contracts/network-session.v1",
+          "domain": "runtime"
+        }
+      ]
     }
   ],
   "relationships": [
@@ -1533,7 +1545,8 @@
           "nodes": [
             "runtime.v1",
             "schedule.v1",
-            "runtime"
+            "runtime",
+            "network-session.v1"
           ]
         }
       }

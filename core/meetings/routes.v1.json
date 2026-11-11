@@ -284,6 +284,13 @@
       "scopes": [
         "bot"
       ]
+    },
+    {
+      "method": "POST",
+      "path": "/bots/{platform}/{native_meeting_id}/network-lease",
+      "scopes": [
+        "bot"
+      ]
     }
   ]
 }

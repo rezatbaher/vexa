@@ -19,6 +19,7 @@ from .backend import Backend, WorkloadHandle
 from .clock import Clock, SystemClock
 from .models import RuntimeEvent, RuntimeState, StopReason, WorkloadSpec, WorkloadStatus
 from .process_backend import ProcessBackend
+from .network_session import NetworkSessions, contract as network_contract
 from .profiles import Profile, ProfileRegistry, Runnable, default_registry
 from .store import (
     InMemoryStore,
@@ -69,6 +70,7 @@ class Runtime:
         owner_quota: Optional[int] = None,
     ) -> None:
         self.backend: Backend = backend or ProcessBackend()
+        self.network_sessions = NetworkSessions(self._expire_network)
         # `profiles` accepts a ProfileRegistry, a plain {name: Runnable|command} dict (legacy/tests),
         # or None (the real default registry). We normalize to a ProfileRegistry.
         self.profiles: ProfileRegistry = _coerce_registry(profiles)
@@ -87,7 +89,24 @@ class Runtime:
         return ev
 
     def _persist(self, spec: WorkloadSpec, status: WorkloadStatus) -> None:
+        if network_contract.ENV in spec.env:
+            spec = spec.model_copy(update={"env": {k:v for k,v in spec.env.items() if k != network_contract.ENV}})
         self.store.set(WorkloadRecord(spec=spec, status=status, owner=self.owner_resolver(spec)))
+
+    def _expire_network(self, workload_id):
+        try:
+            self.stop(workload_id, reason=StopReason.failed)
+        except KeyError:
+            pass
+
+    def renew_network(self, workload_id, token):
+        record = self._record(workload_id)
+        if record.status.state not in (RuntimeState.starting, RuntimeState.running) or self.network_sessions.current(workload_id) is None:
+            raise ValueError("Personal network session is not active")
+        claims = self.network_sessions.authorize(token, self.backend.name)
+        self.backend.network_namespace(claims, workload_id=workload_id)
+        self.network_sessions.accept(workload_id, claims)
+        return {"renewed": True, "expires_at": claims["exp"]}
 
     def _record(self, workload_id: str) -> WorkloadRecord:
         record = self.store.get(workload_id)
@@ -137,6 +156,15 @@ class Runtime:
             if not wid or not name:
                 continue
             self._handles.setdefault(wid, WorkloadHandle(id=wid, impl=name))
+            if info.get("network_session") and info.get("running"):
+                self.backend.kill(self._handles[wid])
+                record=self.store.get(wid)
+                spec=record.spec if record else WorkloadSpec(workloadId=wid,profile="adopted",env={})
+                status=WorkloadStatus(workloadId=wid,profile=spec.profile,state=RuntimeState.stopped,backend=self.backend.name,stoppedAt=_now(),stopReason=StopReason.failed)
+                self._persist(spec,status)
+                self._emit(wid,RuntimeState.stopped,stopReason=StopReason.failed)
+                adopted+=1
+                continue
             if self.store.get(wid) is not None:
                 continue                       # durable store kept the record — handle was the gap
             spec = WorkloadSpec(workloadId=wid, profile="adopted", env={})
@@ -156,6 +184,10 @@ class Runtime:
 
     # ── runtime.v1 operations ────────────────────────────────────────────────
     def create(self, spec: WorkloadSpec) -> WorkloadStatus:
+        network_claims = None
+        if network_contract.ENV in spec.env:
+            network_claims = self.network_sessions.authorize(spec.env[network_contract.ENV], self.backend.name)
+            self.backend.network_namespace(network_claims)
         # runtime.v1: workloadId is the caller-assigned IDEMPOTENCY KEY (ADR 0027). A create for a
         # workload that is still starting/running is a TOUCH — return the live status unchanged: no
         # respawn (the docker backend's name-conflict path would force-delete the RUNNING container,
@@ -171,12 +203,16 @@ class Runtime:
         except KeyError:
             existing = None
         if existing is not None and existing.state in (RuntimeState.starting, RuntimeState.running):
+            if network_claims is not None:
+                self.renew_network(spec.workloadId, spec.env[network_contract.ENV])
             return existing
 
         profile = self.profiles.get(spec.profile)
         if profile is None:
             raise ValueError(f"unknown profile: {spec.profile!r}")
         runnable = profile.runnable
+        if network_contract.ENV in profile.base_env:
+            raise ValueError("Personal network authority must be supplied per workload, never as a profile default")
 
         # Quota check (O-RT-2): reject the N+1th active workload for this owner.
         if self.owner_quota is not None:
@@ -191,6 +227,8 @@ class Runtime:
         self._persist(spec, status)
         self._emit(spec.workloadId, RuntimeState.starting)
         try:
+            if network_claims is not None:
+                self.network_sessions.accept(spec.workloadId, network_claims)
             # The profile's base_env is the deployment-wide floor (e.g. meeting-bot's BOT_SPEAKER_*
             # tuning, rendered onto the runtime pod by the chart); the per-workload spec.env is
             # layered on top so an explicit spec value always wins. Without this merge the base_env
@@ -204,7 +242,14 @@ class Runtime:
             self._handles[spec.workloadId] = self.backend.start(
                 spec.workloadId, runnable, effective_env, effective_resources,
             )
+            if network_claims is not None:
+                current=self.network_sessions.current(spec.workloadId)
+                if current is None or current["exp"]<=time.time():
+                    raise ValueError("Personal network authority ended during workload start")
         except Exception as exc:
+            self.network_sessions.remove(spec.workloadId)
+            if network_claims is not None and spec.workloadId in self._handles:
+                self.backend.kill(self._handles[spec.workloadId])
             # Record the honest terminal state (persist + emit) FIRST — GET /workloads and the
             # callback stream must still see stopped/start_failed — THEN raise so the API answers a
             # non-201 naming the cause. A caught-and-returned status here is a false "spawned" 201
@@ -249,6 +294,7 @@ class Runtime:
 
     def stop(self, workload_id: str, reason: StopReason = StopReason.stopped) -> WorkloadStatus:
         record = self._record(workload_id)
+        self.network_sessions.remove(workload_id)
         status = record.status
         if status.state in (RuntimeState.stopped, RuntimeState.destroyed):
             return status
@@ -276,6 +322,7 @@ class Runtime:
 
     def destroy(self, workload_id: str) -> WorkloadStatus:
         record = self._record(workload_id)
+        self.network_sessions.remove(workload_id)
         h = self._handle_for(workload_id)                           # re-derives post-restart handles
         if h is not None:
             self.backend.cleanup(h)   # raises on an unconfirmed reclaim — destroyed is never a lie

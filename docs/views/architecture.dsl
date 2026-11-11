@@ -69,6 +69,7 @@ system runtime-system  # workload spawn (bot/agent containers)
   contract runtime.v1
   contract schedule.v1
   service runtime
+  contract network-session.v1
 
 system deploy  # deployment + execution-target registry
   contract execution-targets.v1

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/contracts/network-session.v1/network-session.schema.json",
+  "title": "Private network-session lease claims",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["aud", "session", "owner", "gateway", "generation", "workload", "iat", "exp"],
+  "properties": {
+    "aud": {"const": "pathwarden-vexa-network"},
+    "session": {"type": "string", "format": "uuid"},
+    "owner": {"type": "string", "format": "uuid"},
+    "gateway": {"type": "string", "pattern": "^pathwarden-exit-[a-f0-9-]{36}-[1-9][0-9]*$"},
+    "generation": {"type": "integer", "minimum": 1},
+    "workload": {"type": "object", "minProperties": 1, "maxProperties": 8, "propertyNames": {"minLength": 1, "maxLength": 120}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 512}},
+    "iat": {"type": "integer", "minimum": 0},
+    "exp": {"type": "integer", "minimum": 1}
+  }
+}

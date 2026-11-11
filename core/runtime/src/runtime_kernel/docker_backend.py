@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -22,6 +23,7 @@ from .backend import WorkloadHandle
 from .models import Resources
 from .mounts import workspace_binds
 from .profiles import Runnable
+from .network_session import contract as network_contract
 
 MANAGED_LABEL = "runtime.managed"
 WORKLOAD_ID_LABEL = "runtime.workload_id"
@@ -87,6 +89,10 @@ def _in_stack_network(network: Optional[str], inspect_body: dict) -> bool:
     Checks both ``HostConfig.NetworkMode`` (what ``start()`` sets) and the live
     ``NetworkSettings.Networks`` map (covers containers attached by name after create)."""
     if not network:
+        return True
+    labels=(inspect_body.get("Config") or {}).get("Labels") or inspect_body.get("Labels") or {}
+    mode=(inspect_body.get("HostConfig") or {}).get("NetworkMode", "")
+    if isinstance(mode,str) and mode.startswith("container:") and labels.get("runtime.managed")=="true" and labels.get("runtime.network_session") and labels.get("runtime.network_stack")==network:
         return True
     if (inspect_body.get("HostConfig") or {}).get("NetworkMode") == network:
         return True
@@ -199,8 +205,12 @@ class DockerBackend:
         _leaf, worker_labels = _worker_naming(workload_id)
 
         host_config: dict[str, Any] = {}
+        network_claims=None
+        if network_contract.ENV in env:
+            network_claims=network_contract.verify(env[network_contract.ENV],os.getenv(network_contract.PUBLIC_KEY_ENV,""))
+            host_config["NetworkMode"]=self.network_namespace(network_claims)
         network = os.getenv("DOCKER_NETWORK")
-        if network:
+        if network and network_claims is None:
             host_config["NetworkMode"] = network
         shm = _shm_bytes()
         if shm:
@@ -240,7 +250,7 @@ class DockerBackend:
         if binds:
             host_config["Binds"] = binds
 
-        spawn_env = dict(env)
+        spawn_env = {key:value for key,value in env.items() if key!=network_contract.ENV}
         for key in (
             # llm-module dials (provider-agnostic): completion endpoint/credential/model + the
             # harness runner selection. Dispatch-stamped values win (`key not in spawn_env`).
@@ -264,10 +274,13 @@ class DockerBackend:
             if value and key not in spawn_env:
                 spawn_env[key] = value
 
+        network_labels={}
+        if network_claims:
+            network_labels={"runtime.network_session":network_claims["session"],"runtime.network_stack":network or "", "runtime.network_owner":network_claims["owner"]}
         payload: dict[str, Any] = {
             "Image": runnable.image,
             "Env": [f"{k}={v}" for k, v in spawn_env.items()],
-            "Labels": {MANAGED_LABEL: "true", WORKLOAD_ID_LABEL: workload_id, **worker_labels},
+            "Labels": {MANAGED_LABEL: "true", WORKLOAD_ID_LABEL: workload_id, **worker_labels,**network_labels},
             "HostConfig": host_config,
         }
         if runnable.command:
@@ -285,6 +298,29 @@ class DockerBackend:
         if s.status_code not in (204, 304):
             raise RuntimeError(f"docker start {name} failed ({s.status_code}): {s.text.strip()}")
         return WorkloadHandle(id=workload_id, impl=name)
+
+    def network_namespace(self,claims,*,workload_id=None):
+        if os.getenv("VEXA_NETWORK_SESSION_ENABLED","false").lower()!="true":
+            raise ValueError("Personal network sessions are disabled")
+        response=self._req("GET",f"/containers/{claims['gateway']}/json")
+        if response.status_code!=200:
+            raise ValueError("Personal network gateway is unavailable")
+        gateway=response.json() or {}
+        labels=(gateway.get("Config") or {}).get("Labels") or {}
+        network=gateway.get("HostConfig") or {}
+        attached=(gateway.get("NetworkSettings") or {}).get("Networks") or {}
+        cid=gateway.get("Id","")
+        if not re.fullmatch(r"[a-f0-9]{64}",cid) or not (gateway.get("State") or {}).get("Running") or network.get("NetworkMode")!="none" or set(attached)-{"none"} or network.get("Dns")!=["127.0.0.1"] or labels.get("pathwarden.network_session")!=claims["session"] or labels.get("pathwarden.network_owner")!=claims["owner"] or labels.get("pathwarden.network_generation")!=str(claims["generation"]):
+            raise ValueError("Personal network gateway identity or isolation changed")
+        namespace=f"container:{cid}"
+        if workload_id:
+            existing=self._req("GET",f"/containers/{self._cname(workload_id)}/json")
+            if existing.status_code!=200:
+                raise ValueError("Personal network workload is unavailable")
+            body=existing.json() or {}
+            if not _in_stack_network(_stack_network(),body) or (body.get("HostConfig") or {}).get("NetworkMode")!=namespace:
+                raise ValueError("Personal network gateway namespace changed")
+        return namespace
 
     def find(self, workload_id: str) -> Optional[WorkloadHandle]:
         """Re-derive a live handle for a workload whose in-process handle was lost (restart): the
@@ -332,6 +368,14 @@ class DockerBackend:
                     wid = (c.get("Labels") or {}).get(WORKLOAD_ID_LABEL)
                     if wid:
                         found[wid] = self._adoptable(wid, c)
+            if network:
+                query=quote(_json.dumps({"label":[f"{MANAGED_LABEL}=true",f"runtime.network_stack={network}"]}),safe="")
+                routed=self._req("GET",f"/containers/json?all=1&filters={query}")
+                if routed.status_code==200:
+                    for item in routed.json():
+                        labels=item.get("Labels") or {};wid=labels.get(WORKLOAD_ID_LABEL)
+                        if wid and labels.get("runtime.network_session"):
+                            found[wid]=self._adoptable(wid,item)
             # Fallback: prefix-named containers WITHOUT the labels (spawned before the labels
             # existed). Compose-owned services can share the prefix — exclude anything compose owns.
             fallback_qs = f"?all=1&filters={_filters({})}" if network else "?all=1"
@@ -397,8 +441,17 @@ class DockerBackend:
             if r.status_code != 200:
                 logger.warning("reap: container listing failed (%s)", r.status_code)
                 return 0
+            candidates={item["Id"]:item for item in r.json() if item.get("Id")}
+            if network:
+                routed_spec={"label":[f"{MANAGED_LABEL}=true",f"runtime.network_stack={network}"],"status":["exited"]}
+                routed=self._req("GET",f"/containers/json?all=1&filters={quote(_json.dumps(routed_spec),safe='')}")
+                if routed.status_code==200:
+                    for item in routed.json():
+                        labels=item.get("Labels") or {}
+                        if item.get("Id") and labels.get("runtime.network_session") and labels.get("runtime.network_stack")==network:
+                            candidates[item["Id"]]=item
             now = datetime.now(timezone.utc)
-            for c in r.json():
+            for c in candidates.values():
                 cid = c.get("Id")
                 if not cid:
                     continue
@@ -456,13 +509,16 @@ class DockerBackend:
         """Shape one /containers/json entry as an adoption record for the kernel."""
         name = self._cname(workload_id)
         running = c.get("State") == "running"
-        return {
+        result = {
             "workload_id": workload_id,
             "name": name,
             "running": running,
             # /containers/json has no exit code — inspect only the exited ones.
             "exit_code": None if running else self._exit_from_inspect(name),
         }
+        if (c.get("Labels") or {}).get("runtime.network_session"):
+            result["network_session"]=True
+        return result
 
     def exit_code(self, h: WorkloadHandle) -> Optional[int]:
         return self._exit_from_inspect(h._impl)  # type: ignore[attr-defined]

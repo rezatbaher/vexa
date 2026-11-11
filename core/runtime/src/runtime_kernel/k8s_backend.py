@@ -247,6 +247,8 @@ class K8sBackend:
         """Submit the workload's complete Pod manifest. ``resources`` (the kernel's effective sizing:
         the spec's own, else the profile's chart-configured default) becomes the container's
         requests+limits, which is what a namespace ResourceQuota admits on."""
+        if "VEXA_NETWORK_SESSION" in env:
+            raise ValueError("Personal network sessions require the Docker backend")
         if not runnable.image:
             raise ValueError("k8s backend requires an image")
         name = self._pname(workload_id)
