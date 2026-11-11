@@ -28,6 +28,11 @@ export const googleInitialAdmissionIndicators: string[] = [
   'button[aria-label*="Present now"]',
 ];
 
+export const googleJoinRefusedIndicators: string[] = [
+  "text=You can't join this video call",
+  "text=You can’t join this video call",
+];
+
 export const googleWaitingRoomIndicators: string[] = [
   // Modern waiting room text patterns (2024 Google Meet UI)
   'text="Asking to be let in..."',

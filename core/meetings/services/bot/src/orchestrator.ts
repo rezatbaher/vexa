@@ -208,7 +208,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     }
     if (outcome !== 'admitted') {
       const reason = OUTCOME_FAIL[outcome];
-      await emit('failed', { failure_stage: 'awaiting_admission', completion_reason: reason, exit_code: 1 });
+      await emit('failed', { failure_stage: 'awaiting_admission', completion_reason: reason, reason: deps.join.failureReason?.(), exit_code: 1 });
       return { exitCode: 1, status: 'failed', completionReason: reason };
     }
     if (cur !== 'active') await emit('active');   // the join driver may already have reported active

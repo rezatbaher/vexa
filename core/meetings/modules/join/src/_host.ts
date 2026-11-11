@@ -17,6 +17,8 @@ export interface BotConfig {
   /** meeting passcode (zoom passcode screen / jitsi room password) */
   passcode?: string;
   authenticated?: boolean;
+  joinSignal?: AbortSignal;
+  joinDeadline?: number;
   uiInteractionMode?: "humanized" | "synthetic";
   automaticLeave?: {
     waitingRoomTimeout: number;

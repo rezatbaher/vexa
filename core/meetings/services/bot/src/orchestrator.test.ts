@@ -136,6 +136,17 @@ async function main(): Promise<void> {
     check('rejected: events conform', allConform(lc.events));
   }
 
+  {
+    const lc = recordingSink();
+    const driver = mockJoin('rejected');
+    const detail = 'google_meet_join_refused: Google Meet refused 3 of 3 knocks';
+    driver.failureReason = () => detail;
+    const result = await createOrchestrator(inv(), { lifecycle: lc, join: driver, pipeline: noopPipeline(), acts: noopActs() }).run();
+    check('provider refusal stays permanent', result.completionReason === 'awaiting_admission_rejected');
+    check('provider refusal detail reaches lifecycle transport', last(lc.events).reason === detail);
+    check('provider refusal lifecycle conforms', allConform(lc.events));
+  }
+
   // ── admission timeout → failed(awaiting_admission_timeout) ──
   {
     const lc = recordingSink();

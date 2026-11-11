@@ -12,6 +12,7 @@ import {
 // AdmissionError + AdmissionOutcome moved to ../shared/admission so every platform (jitsi/zoom/
 // teams) throws the SAME typed error the JoinDriver maps, without one platform depending on another.
 import { AdmissionError } from "../shared/admission";
+import { throwIfGoogleJoinRefused, checkForGoogleJoinRefused, assertGoogleJoinActive } from "./refusal";
 
 // Detect an active reCAPTCHA (enterprise) challenge. Google renders it in iframes whose
 // URL contains "/recaptcha/"; it can sit on the same screen as error affordances
@@ -224,7 +225,7 @@ export async function checkForWaitingRoomIndicators(page: Page): Promise<boolean
     try {
       const element = await page.locator(waitingIndicator).first();
       if (await element.isVisible()) {
-        return true;
+        return !(await checkForGoogleJoinRefused(page));
       }
     } catch {
       continue;
@@ -266,7 +267,14 @@ export async function waitForGoogleMeetingAdmission(
   timeout: number,
   botConfig: BotConfig
 ): Promise<boolean> {
+  const guard = async () => {
+    assertGoogleJoinActive(page, botConfig.joinSignal);
+    await throwIfGoogleJoinRefused(page, "admission");
+  };
+  const remainingBudget = () => botConfig.joinDeadline === undefined
+    ? Infinity : botConfig.joinDeadline + getEscalationExtensionMs() - Date.now();
   try {
+    await guard();
     log("Waiting for Google Meet meeting admission...");
     
     // Take screenshot at start of admission check
@@ -344,7 +352,8 @@ export async function waitForGoogleMeetingAdmission(
       let unknownStateDuration = 0;
       const effectiveTimeout = () => timeout + getEscalationExtensionMs();
 
-      while (Date.now() - startTime < effectiveTimeout()) {
+      while (Date.now() - startTime < effectiveTimeout() && remainingBudget() > 0) {
+          await guard();
         // Host denial can leave stale waiting-room text in the DOM. Check the
         // terminal rejection state before treating the page as still waiting.
         await throwIfGoogleAdmissionRejected(page, "waiting-room polling");
@@ -394,7 +403,8 @@ export async function waitForGoogleMeetingAdmission(
       const startTime = Date.now();
       let unknownStateDuration2 = 0;
       const effectiveTimeout2 = () => timeout + getEscalationExtensionMs();
-      while (Date.now() - startTime < effectiveTimeout2()) {
+      while (Date.now() - startTime < effectiveTimeout2() && remainingBudget() > 0) {
+          await guard();
         // #444 — the `blocked` state is wired (callBlockedCallback), but NOT emitted yet.
         // hasRecaptchaChallenge() is too loose to drive it: Google Meet loads reCAPTCHA
         // Enterprise INVISIBLY on every normal join (a background bot-scoring frame), so
@@ -452,7 +462,8 @@ export async function waitForGoogleMeetingAdmission(
         // Re-run the waiting room loop with the remaining time
         const checkInterval = 2000;
         const startTime2 = Date.now();
-        while (Date.now() - startTime2 < timeout) {
+        while (Date.now() - startTime2 < timeout && remainingBudget() > 0) {
+          await guard();
           await throwIfGoogleAdmissionRejected(page, "late waiting-room polling");
 
           const stillWaiting = await checkForWaitingRoomIndicators(page);
@@ -467,6 +478,7 @@ export async function waitForGoogleMeetingAdmission(
     
     // Final check after waiting/polling
     log("Performing final admission check after waiting/polling window...");
+    await guard();
     const finalAdmissionFound = await checkForGoogleAdmissionIndicators(page);
     const finalLobbyVisible = await checkForWaitingRoomIndicators(page);
     if (finalAdmissionFound && !finalLobbyVisible) {

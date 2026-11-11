@@ -12,6 +12,7 @@ import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent } from "./
 import { prepareForRecording, leaveGoogleMeet } from "./googlemeet/leave";
 import { startGoogleRemovalMonitor } from "./googlemeet/removal";
 import { startGoogleAlonenessMonitor } from "./googlemeet/alone";
+import { knockUntilGoogleAccepts, assertGoogleJoinActive } from "./googlemeet/refusal";
 import { joinMicrosoftTeams } from "./msteams/join";
 import { waitForTeamsMeetingAdmission, checkForTeamsAdmissionSilent } from "./msteams/admission";
 import { prepareForRecording as prepareForTeamsRecording, leaveMicrosoftTeams } from "./msteams/leave";
@@ -54,6 +55,7 @@ export interface JoinOptions {
    *  (e.g. from @vexa/remote-browser); the brick skips guest name-entry. */
   authenticated?: boolean;
   waitingRoomTimeoutMs?: number;
+  signal?: AbortSignal;
   /** a speaking (voice-agent) bot keeps its meeting microphone ON; audibility is gated at PulseAudio */
   voiceAgentEnabled?: boolean;
   /** turn on the live debug view (VNC pixels on Linux, CDP control anywhere) */
@@ -124,10 +126,16 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
       page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
     );
   } else if (platform === "google_meet") {
-    await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
-    admitted = await waitForGoogleMeetingAdmission(
-      page, botConfig.automaticLeave!.waitingRoomTimeout, botConfig,
-    );
+    const timeout = botConfig.automaticLeave!.waitingRoomTimeout;
+    const deadline = Date.now() + timeout;
+    botConfig.joinSignal = opts.signal;
+    botConfig.joinDeadline = deadline;
+    admitted = await knockUntilGoogleAccepts(page, timeout, async () => {
+      assertGoogleJoinActive(page, opts.signal, deadline);
+      await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
+      assertGoogleJoinActive(page, opts.signal, deadline);
+      return waitForGoogleMeetingAdmission(page, Math.max(1, deadline - Date.now()), botConfig);
+    }, Date.now, opts.signal);
   } else {
     // Explicit refusal, never a fallthrough: an unknown platform used to silently run the GOOGLE
     // MEET join flow against whatever URL it was handed — the wrong flow on the wrong site, failing
@@ -147,6 +155,7 @@ export { joinGoogleMeeting, waitForGoogleMeetingAdmission, checkForGoogleAdmissi
 // (AuthSessionError, an AdmissionError subclass) as the permanent `auth_session_missing` — never
 // collapsed into a transient (retried) `join_failure` (G1).
 export { AdmissionError } from "./shared/admission";
+export { GoogleJoinRefusedError, GOOGLE_JOIN_REFUSED } from "./googlemeet/refusal";
 export type { AdmissionOutcome } from "./shared/admission";
 export { AuthSessionError } from "./googlemeet/join";
 export { joinMicrosoftTeams, waitForTeamsMeetingAdmission, checkForTeamsAdmissionSilent, prepareForTeamsRecording, leaveMicrosoftTeams, startTeamsRemovalMonitor };

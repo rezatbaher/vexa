@@ -25,6 +25,8 @@ export interface JoinDriver {
   /** Join + await admission. `report` fires on each intermediate lifecycle state
    *  (awaiting_admission / needs_help / active). Resolves with the verdict. */
   join(report: (s: BotStatus) => void | Promise<void>): Promise<JoinOutcome>;
+  /** Safe typed provider detail for the terminal lifecycle reason, when available. */
+  failureReason?(): string | undefined;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
   /** Watch for the meeting EMPTYING OUT (every other participant left) while active; returns a

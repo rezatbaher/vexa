@@ -11,6 +11,7 @@ import {
 } from "./selectors";
 import { HumanizedInteractor, MOCAP_LIBRARY } from "./humanized";
 import { AdmissionError } from "../shared/admission";
+import { watchGoogleJoinRefusal, throwIfGoogleJoinRefused, assertGoogleJoinActive } from "./refusal";
 
 /** Thrown when authenticated mode detects a signed-out browser profile. Extends AdmissionError so
  *  the JoinDriver's single `instanceof` catch maps the typed `auth_session_missing` outcome to a
@@ -58,33 +59,28 @@ export async function waitForAnySelector(
   page: Page,
   selectors: string[],
   timeoutMs: number,
-  label: string
+  label: string,
+  guard?: () => Promise<void>
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
-  // First selector to MATCH wins; a per-selector timeout/parse rejection must
-  // NOT abort the others (so the locale-agnostic + English fallbacks all get a
-  // fair chance). We resolve on first success and only fail once every selector
-  // has settled without a match.
-  const winner = await new Promise<{ handle: ElementHandle<Element>; selector: string } | null>((resolve) => {
-    let pending = selectors.length;
-    let settled = false;
-    if (pending === 0) { resolve(null); return; }
-    for (const sel of selectors) {
-      page
-        .waitForSelector(sel, { timeout: timeoutMs, state: "visible" })
-        .then((el) => {
-          if (!settled && el) { settled = true; resolve({ handle: el as ElementHandle<Element>, selector: sel }); }
-          else if (--pending === 0 && !settled) { settled = true; resolve(null); }
-        })
-        .catch(() => {
-          if (--pending === 0 && !settled) { settled = true; resolve(null); }
-        });
+  const deadline = Date.now() + timeoutMs;
+  do {
+    await guard?.();
+    for (const selector of selectors) {
+      let handle: ElementHandle<Element> | null = null;
+      try {
+        if (await page.locator(selector).first().isVisible()) {
+          handle = await page.waitForSelector(selector, { timeout: 100, state: "visible" });
+        }
+      } catch { /* detached or absent; inspect the other selectors */ }
+      await guard?.();
+      if (handle) {
+        log("Located " + label + " via selector: " + selector);
+        return { handle, selector };
+      }
     }
-  });
-
-  if (winner) {
-    log(`Located ${label} via selector: ${winner.selector}`);
-    return winner;
-  }
+    await page.waitForTimeout(Math.min(100, Math.max(0, deadline - Date.now())));
+  } while (Date.now() < deadline);
+  await guard?.();
 
   const shot = `/app/storage/screenshots/bot-checkpoint-${label.replace(/[^a-z0-9]+/gi, "-")}-not-found.png`;
   try { await page.screenshot({ path: shot, fullPage: true }); } catch { /* best-effort */ }
@@ -98,7 +94,18 @@ export async function joinGoogleMeeting(
   botName: string,
   botConfig: BotConfig
 ): Promise<void> {
-  await page.goto(meetingUrl, { waitUntil: "domcontentloaded" });
+  watchGoogleJoinRefusal(page);
+  const guard = async () => {
+    assertGoogleJoinActive(page, botConfig.joinSignal);
+    await throwIfGoogleJoinRefused(page, "lobby");
+    assertGoogleJoinActive(page, botConfig.joinSignal, botConfig.joinDeadline);
+  };
+  await guard();
+  await page.goto(meetingUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: Math.min(30000, Math.max(1, (botConfig.joinDeadline ?? Date.now() + 30000) - Date.now())),
+  });
+  await guard();
   await page.bringToFront();
 
   // Take screenshot after navigation
@@ -135,6 +142,7 @@ export async function joinGoogleMeeting(
   // Click a resolved element handle via humanized motion, falling back to a
   // synthetic handle click if humanized interaction is off or errors.
   const clickHandle = async (handle: ElementHandle<Element>, label: string): Promise<void> => {
+    await guard();
     if (humanizer) {
       try {
         await humanizer.navigateAndClick(page, handle);
@@ -214,7 +222,7 @@ export async function joinGoogleMeeting(
       page,
       googleAuthJoinCtaSelectors,
       30000,
-      "authenticated join CTA"
+      "authenticated join CTA", guard
     );
 
     // Signed-out guard: a guest lobby (name input rendered) means the persisted
@@ -243,7 +251,7 @@ export async function joinGoogleMeeting(
       page,
       googleNameInputSelectors,
       120000,
-      "name input"
+      "name input", guard
     );
     log("Name input field found.");
 
@@ -265,7 +273,7 @@ export async function joinGoogleMeeting(
       page,
       googleJoinButtonSelectors,
       60000,
-      "join button"
+      "join button", guard
     );
     await clickHandle(joinHandle!, "ask_to_join");
     log(`${botName} joined the Google Meet Meeting.`);

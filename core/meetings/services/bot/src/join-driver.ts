@@ -8,7 +8,7 @@
 import type { Page } from '@vexa/remote-browser';
 import {
   joinMeeting,
-  AdmissionError,
+  AdmissionError, GoogleJoinRefusedError,
   leaveGoogleMeet, leaveMicrosoftTeams, leaveZoomMeeting, leaveJitsiMeeting,
   startGoogleRemovalMonitor, startTeamsRemovalMonitor, startZoomRemovalMonitor, startJitsiRemovalMonitor,
   startGoogleAlonenessMonitor,
@@ -59,9 +59,15 @@ function joinPlatform(p: string): JoinPlatform {
 
 export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver {
   const platform = joinPlatform(inv.platform);
+  let joinAbort: AbortController | undefined;
+  let failureReason: string | undefined;
   return {
+    failureReason: () => failureReason,
     async join(report): Promise<JoinOutcome> {
       let r;
+      const controller = new AbortController();
+      joinAbort = controller;
+      failureReason = undefined;
       try {
         r = await joinMeeting(page, {
           meetingUrl: inv.meetingUrl ?? '',
@@ -70,6 +76,7 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
           passcode: inv.passcode,                      // zoom passcode screen / jitsi room password
           authenticated: inv.authenticated,            // join as a signed-in user (persistent context)
           waitingRoomTimeoutMs: inv.automaticLeave?.waitingRoomTimeout,
+          signal: controller.signal,
           voiceAgentEnabled: !!inv.voiceAgentEnabled,  // keep the meeting mic ON for a speaking bot
           hooks: { onState: (s: JoinState) => { const bs = mapState(s); if (bs) void report(bs); } },
         });
@@ -78,8 +85,11 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
         // control plane records the truth, not a generic retried `join_failure` (G1). A genuinely
         // unexpected throw (browser crash, navigation error) is NOT an AdmissionError → re-raise so
         // the orchestrator classifies it as a transient join_failure.
+        if (e instanceof GoogleJoinRefusedError) failureReason = e.message;
         if (e instanceof AdmissionError) return admissionOutcomeToJoinOutcome(e.outcome);
         throw e;
+      } finally {
+        if (joinAbort === controller) joinAbort = undefined;
       }
       if (r.admitted) { await report('active'); return 'admitted'; }
       return (r.state === 'blocked' || r.state === 'needs_human_help') ? 'blocked' : 'rejected';
@@ -107,6 +117,7 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
       await leaveGoogleMeet(page, undefined, reason);
     },
     async withdraw(reason) {
+      joinAbort?.abort();
       // Bug 2 — cancel a PENDING join from the waiting room / pre-join screen. Two-step, both
       // best-effort:
       //  1. Click the platform's cancel/leave affordance. The stateless leave-click helpers already

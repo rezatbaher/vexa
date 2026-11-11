@@ -51,4 +51,13 @@ def project_list_data(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     if not isinstance(data, dict):
         return {}
-    return {k: v for k, v in data.items() if k not in LIST_OMIT_KEYS}
+    projected = {k: v for k, v in data.items() if k not in LIST_OMIT_KEYS}
+    # This reserved lightweight field is derived only from a typed terminal verdict.
+    # Raw exception detail and logs remain omitted from every list/status projection.
+    projected.pop("join_refusal_reason", None)
+    error = data.get("last_error")
+    detail = error.get("reason") if isinstance(error, dict) else None
+    if (data.get("completion_reason") == "awaiting_admission_rejected"
+            and isinstance(detail, str) and detail.startswith("google_meet_join_refused:")):
+        projected["join_refusal_reason"] = "google_meet_join_refused"
+    return projected

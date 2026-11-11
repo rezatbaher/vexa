@@ -65,6 +65,7 @@ async function main(): Promise<void> {
   try {
     ({ context, page } = await launchPersistentBrowser({ dataDir, args: ['--no-sandbox', '--mute-audio', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'], headless: true }));
   } catch (e) {
+    if (process.env.VEXA_REQUIRE_BROWSER_FIXTURES === "1") throw e;
     console.log(`  ⚠️ SKIP — headless Chromium unavailable in this environment: ${(e as Error).message?.split('\n')[0]}`);
     process.exit(0);
   }
