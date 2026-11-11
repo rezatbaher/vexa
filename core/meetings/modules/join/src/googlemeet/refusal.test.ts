@@ -3,7 +3,7 @@ import { joinMeeting } from "../index";
 import { AdmissionError } from "../shared/admission";
 import { joinGoogleMeeting, waitForAnySelector } from "./join";
 import { checkForWaitingRoomIndicators, waitForGoogleMeetingAdmission } from "./admission";
-import { googleJoinButtonSelectors, googleNameInputSelectors } from "./selectors";
+import { googleJoinButtonSelectors, googleNameInputSelectors, googleJoinRefusedIndicators } from "./selectors";
 import {
   GoogleJoinRefusedError, watchGoogleJoinRefusal, checkForGoogleJoinRefused,
   knockUntilGoogleAccepts, assertGoogleJoinActive,
@@ -12,15 +12,18 @@ import {
 type Attempt = "before" | "after" | "admit";
 function fixture(plan: Attempt[]) {
   const listeners: ((response: any) => void)[] = [];
-  let attempts = 0, admitted = false, clicked = false, closed = false;
+  let attempts = 0, admitted = false, clicked = false, closed = false, refusedScreen = false;
   const states: string[] = [];
   const response = (call: string, status = 403, host = "meet.google.com") => {
+    if (status === 403 && host === "meet.google.com" &&
+        ["MeetingSpaceService/ResolveMeetingSpace", "MeetingDeviceService/CreateMeetingDevice"].includes(call)) refusedScreen = true;
     for (const listener of listeners) listener({
       status: () => status,
       url: () => "https://" + host + "/$rpc/google.rtc.meetings.v1." + call,
     });
   };
   const visible = (selector: string) =>
+    (refusedScreen && googleJoinRefusedIndicators.includes(selector)) ||
     (!clicked && (googleNameInputSelectors.includes(selector) || googleJoinButtonSelectors.includes(selector))) ||
     (admitted && selector === '[data-self-name]');
   const handle = (selector: string) => ({
@@ -39,7 +42,7 @@ function fixture(plan: Attempt[]) {
     isClosed: () => closed,
     close: async () => { closed = true; },
     goto: async () => {
-      attempts++; admitted = false; clicked = false;
+      attempts++; admitted = false; clicked = false; refusedScreen = false;
       if (plan[attempts - 1] === "before") response("MeetingSpaceService/ResolveMeetingSpace");
     },
     bringToFront: async () => {}, screenshot: async () => {},

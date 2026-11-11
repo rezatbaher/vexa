@@ -332,7 +332,7 @@ export async function joinGoogleMeeting(
     await throwIfGoogleJoinRefused(page, "lobby");
     assertGoogleJoinActive(page, botConfig.joinSignal, botConfig.joinDeadline);
   };
-  await guard();
+  assertGoogleJoinActive(page, botConfig.joinSignal, botConfig.joinDeadline);
   await page.goto(withPinnedMeetLocale(meetingUrl, resolveBotUiLocale()), {
     waitUntil: "domcontentloaded",
     timeout: Math.min(30000, Math.max(1, (botConfig.joinDeadline ?? Date.now() + 30000) - Date.now())),
