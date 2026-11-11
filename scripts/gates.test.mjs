@@ -9,14 +9,43 @@
 // stay green through exactly the bug it was written to catch. The planted file IS the input
 // population: `git grep --untracked` reads the working tree, so a file on disk is a real input.
 
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, rmSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, mkdirSync, existsSync, mkdtempSync, copyFileSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// The tree every gate in this file runs against: a private copy of the checkout's files (tracked,
+// plus untracked and not ignored: the population `git grep --untracked` reads), made once per run,
+// with git pointed at the checkout's own repository. Fixtures plant and edit files in the COPY.
+// node --test runs test FILES in parallel, and other files run gates over the real checkout (for
+// example publish-edge.test.mjs expects gate:config-contract green), so a fixture written into the
+// checkout reds them whenever their read lands in its window; on CI's three-wide runner it did on
+// every run. Tests in this file run one at a time, so editing the copy in place and restoring it
+// stays race-free.
+let TREE = null;
+let GIT_ENV = null;
+after(() => { if (TREE) rmSync(TREE, { recursive: true, force: true }); }); // once, after every test in the file
+function tree() {
+  if (TREE) return TREE;
+  const copy = mkdtempSync(join(tmpdir(), "vexa-gates-tree-"));
+  const files = execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: ROOT })
+    .toString().split("\0").filter(Boolean);
+  for (const f of files) {
+    if (!existsSync(join(ROOT, f))) continue; // deleted in the working tree, not yet committed
+    mkdirSync(dirname(join(copy, f)), { recursive: true });
+    copyFileSync(join(ROOT, f), join(copy, f));
+  }
+  // installed packages are read, never written: the gates' own imports (ajv, for example) resolve through a link
+  if (existsSync(join(ROOT, "node_modules"))) symlinkSync(join(ROOT, "node_modules"), join(copy, "node_modules"));
+  const gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: ROOT, encoding: "utf8" }).trim();
+  GIT_ENV = { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: copy };
+  return (TREE = copy);
+}
 
 // admin-api is declared in deploy/db-budget.json (pool_size 5 / max_overflow 10), so a literal
 // planted here is compared against a real ceiling. agent-api is a real service dir that is NOT
@@ -35,7 +64,7 @@ const POOL_LITERALS = "configure(url, pool_size=20, max_overflow=30)\n";
 // another run, with no trace of who dropped it. So remember the topmost ancestor that did not
 // already exist and prune from there.
 function withPlanted(relPath, body, fn) {
-  const abs = join(ROOT, relPath);
+  const abs = join(tree(), relPath);
   const dir = dirname(abs);
   let prune = null;
   for (let d = dir; !existsSync(d); d = dirname(d)) prune = d;
@@ -51,7 +80,7 @@ function withPlanted(relPath, body, fn) {
 
 function runDbBudget() {
   try {
-    return { green: true, out: execFileSync("node", ["scripts/gates.mjs", "db-budget"], { cwd: ROOT, encoding: "utf8" }) };
+    return { green: true, out: execFileSync("node", ["scripts/gates.mjs", "db-budget"], { cwd: tree(), env: GIT_ENV, encoding: "utf8" }) };
   } catch (e) {
     return { green: false, out: `${e.stdout || ""}${e.stderr || ""}` };
   }
@@ -113,4 +142,209 @@ test("a production file using the *_test.py suffix is still counted (config_test
 test("a test-only create_async_engine does not invent a service in the budget", () => {
   const r = withPlanted(PHANTOM_TEST_FILE, "engine = create_async_engine(FAKE_URL)\n", runDbBudget);
   assert.equal(r.green, true, `a test fixture phantomed agent-api into the connection budget:\n${r.out}`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// #653 — gate:image-licenses and gate:runtime-parity. Same plant-and-run-the-real-gate discipline: a
+// gate that never reds on the input it was written to catch is theatre. These edit a tracked deploy
+// file in place, run the real gate as a subprocess, and restore — so each RED is the actual pipeline
+// firing, not a stubbed parse. Every fixture is paired with the vacuity control that the clean tree
+// is green (a red there would invalidate the fixture below it).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+function runGate(name) {
+  try { return { green: true, out: execFileSync("node", ["scripts/gates.mjs", name], { cwd: tree(), env: GIT_ENV, encoding: "utf8" }) }; }
+  catch (e) { return { green: false, out: `${e.stdout || ""}${e.stderr || ""}` }; }
+}
+// Temporarily replace `find`→`repl` in a tracked file of the copy, run fn, always restore the exact original bytes.
+function withEdited(relPath, find, repl, fn) {
+  const abs = join(tree(), relPath);
+  const orig = readFileSync(abs, "utf8");
+  const edited = orig.replace(find, repl);
+  assert.notEqual(edited, orig, `fixture setup: pattern not found in ${relPath} — the test would prove nothing`);
+  writeFileSync(abs, edited);
+  try { return fn(); } finally { writeFileSync(abs, orig); }
+}
+
+
+// ── gate:config-contract check 6 — the shared lite entrypoint (F130) ────────────────────────────
+// Checks 3 and 4 walk compose, helm and the supervisord program env in BOTH directions.
+// deploy/lite/entrypoint.sh was read ONLY as check 3's fallback, so it was the one surface, in the
+// one direction, that nothing walked: an export whose declaration AND reader were both deleted left
+// no refusal and no warning. Measured on the tip before the fix — the same plant was green.
+const LITE_ENTRYPOINT = "deploy/lite/entrypoint.sh";
+
+test("config-contract vacuity: the committed lite entrypoint is green", () => {
+  const r = runGate("config-contract");
+  assert.equal(r.green, true, `the clean tree must be green or the fixture below proves nothing:\n${r.out}`);
+});
+
+test("an entrypoint.sh export that no adopted declaration carries is RED, named by file:line", () => {
+  const r = withEdited(LITE_ENTRYPOINT, "\nexport ", "\nexport VEXA_PHANTOM_ENTRY=1\nexport ",
+    () => runGate("config-contract"));
+  assert.equal(r.green, false, `a phantom lite export passed the contract gate:\n${r.out}`);
+  assert.match(r.out, /entrypoint\.sh:\d+ exports VEXA_PHANTOM_ENTRY/,
+    `the failure must name the FILE AND LINE the operator has to open:\n${r.out}`);
+});
+
+const COMPOSE = "deploy/compose/docker-compose.yml";
+const VALUES = "deploy/helm/charts/vexa/values.yaml";
+const LITE = "deploy/lite/Dockerfile.lite";
+const LITE_MAKEFILE = "deploy/lite/Makefile";
+const IMG_MANIFEST = "image-licenses.json";
+
+// ── gate:runtime-parity ─────────────────────────────────────────────────────────────────────────
+
+test("runtime-parity vacuity: the committed tree (all surfaces on Valkey 8) is green", () => {
+  const r = runGate("runtime-parity");
+  assert.equal(r.green, true, `the clean tree already reds — the fixtures below prove nothing:\n${r.out}`);
+});
+
+test("runtime-parity RED (#636): Lite reverting to apt redis-server (jammy 6.0.16) reds against XAUTOCLAIM", () => {
+  const r = withEdited(LITE, "supervisor postgresql-client", "supervisor redis-server postgresql-client",
+    () => runGate("runtime-parity"));
+  assert.equal(r.green, false, "a surface pinned below XAUTOCLAIM's floor no longer reds — the #636 rung is inert");
+  assert.match(r.out, /lite/);
+  assert.match(r.out, /XAUTOCLAIM/);
+});
+
+test("runtime-parity RED (#637 class): a compose pin below a used command's floor reds", () => {
+  const r = withEdited(COMPOSE, "image: valkey/valkey:8-alpine", "image: redis:6.0-alpine",
+    () => runGate("runtime-parity"));
+  assert.equal(r.green, false, "a compose engine pinned below the used-command floor no longer reds");
+  assert.match(r.out, /compose/);
+  assert.match(r.out, /6\.0/);
+});
+
+// ── gate:image-licenses ─────────────────────────────────────────────────────────────────────────
+
+test("image-licenses vacuity: the committed tree (Valkey everywhere) is green", () => {
+  const r = runGate("image-licenses");
+  assert.equal(r.green, true, `the clean tree already reds — the fixtures below prove nothing:\n${r.out}`);
+});
+
+for (const assignment of [
+  "EVIL_IMAGE ?= evil/agpl-thing:1.0",
+  "EVIL_IMAGE := evil/agpl-thing:1.0",
+  "EVIL_IMAGE = evil/agpl-thing:1.0",
+  "export EVIL_IMAGE ?= evil/agpl-thing:1.0",
+  "override EVIL_IMAGE := evil/agpl-thing:1.0",
+]) {
+  test(`image-licenses RED: an undeclared Lite Makefile image variable reds (${assignment})`, () => {
+    const r = withEdited(LITE_MAKEFILE, /$/, `\n${assignment}\n`,
+      () => runGate("image-licenses"));
+    assert.equal(r.green, false, "an undeclared Lite image variable passed the gate");
+    assert.match(r.out, /undeclared pinned image/);
+    assert.match(r.out, /evil\/agpl-thing/);
+    assert.match(r.out, /deploy\/lite\/Makefile/);
+  });
+}
+
+test("image-licenses RED: an undeclared bare Lite Makefile image name reds", () => {
+  const r = withEdited(LITE_MAKEFILE, /$/, "\nEVIL_IMAGE ?= evilbare\n",
+    () => runGate("image-licenses"));
+  assert.equal(r.green, false, "an undeclared bare Lite image name passed the gate");
+  assert.match(r.out, /undeclared pinned image/);
+  assert.match(r.out, /evilbare/);
+  assert.match(r.out, /deploy\/lite\/Makefile/);
+});
+
+test("image-licenses GREEN: Lite recipe assignments are not image variables", () => {
+  const r = withEdited(LITE_MAKEFILE, /$/, "\n\tFOO_IMAGE=evil/agpl-thing:1.0 true\n",
+    () => runGate("image-licenses"));
+  assert.equal(r.green, true, `a shell recipe assignment red the image gate:\n${r.out}`);
+});
+
+test("image-licenses RED: an undeclared pinned image (a stray redis:7.4) reds", () => {
+  // redis:7.4 is exactly the source-available (RSALv2/SSPL) engine #653 keeps out; undeclared ⇒ loud red.
+  const r = withEdited(COMPOSE, "image: valkey/valkey:8-alpine", "image: redis:7.4-alpine",
+    () => runGate("image-licenses"));
+  assert.equal(r.green, false, "an undeclared image pin sailed through — the 'green gate ships an un-audited component' hole is back");
+  assert.match(r.out, /undeclared pinned image/);
+  assert.match(r.out, /redis:7\.4/);
+});
+
+test("image-licenses RED: the Lite apt redis-server parity trap reds", () => {
+  const r = withEdited(LITE, "supervisor postgresql-client", "supervisor redis-server postgresql-client",
+    () => runGate("image-licenses"));
+  assert.equal(r.green, false, "the Lite apt redis-server guard is inert");
+  assert.match(r.out, /redis-server/);
+});
+
+test("image-licenses RED: a bundled component under a source-available licence (SSPL) is FORBIDDEN", () => {
+  // The strict redistribution path: anything baked into a vexaai/* image must be Cat A (or B-with-reason).
+  const inject = '"bundled": [\n    {\n      "name": "redis",\n      "license": "SSPLv1",\n      "artifact": "vexaai/vexa-lite",\n      "reason": "test fixture"\n    },';
+  const r = withEdited(IMG_MANIFEST, '"bundled": [', inject, () => runGate("image-licenses"));
+  assert.equal(r.green, false, "a source-available bundled component was not forbidden — the redistribution guard is inert");
+  assert.match(r.out, /FORBIDDEN \(Cat X\)/);
+  assert.match(r.out, /redis/);
+});
+
+const PGBOUNCER_TPL = "deploy/helm/charts/vexa/templates/deployment-pgbouncer.yaml";
+
+test("image-licenses RED: an undeclared image pinned in a helm TEMPLATE (not just values) reds", () => {
+  // The gate must read helm templates, not only compose + values — a literal `image:` in a template
+  // is a real pin. An undeclared one must red, else the 'green gate ships an un-audited component' hole.
+  // Anchored on the pgbouncer template since the MinIO bucket-init Job it used to edit left the
+  // chart (storage.s3). The test's subject is unchanged: inject a LITERAL pin into a template and
+  // require the gate to read it.
+  const r = withEdited(PGBOUNCER_TPL,
+    'image: "{{ .Values.pgbouncer.image }}"',
+    "image: somevendor/unaudited:1.2",
+    () => runGate("image-licenses"));
+  assert.equal(r.green, false, "an undeclared image in a helm template sailed through — the gate never read templates");
+  assert.match(r.out, /undeclared pinned image/);
+  assert.match(r.out, /somevendor\/unaudited/);
+});
+
+test("image-licenses RED: an undeclared structured Helm repository/tag pin reds", () => {
+  const injected = [
+    "reviewProbe:",
+    "  image:",
+    "    repository: somevendor/unaudited",
+    "    tag: 1.2",
+    "",
+    "ingress:",
+  ].join("\n");
+  const r = withEdited(VALUES, "\ningress:\n", `\n${injected}\n`, () => runGate("image-licenses"));
+  assert.equal(r.green, false, "a structured Helm repository/tag image pin sailed through");
+  assert.match(r.out, /undeclared pinned image/);
+  assert.match(r.out, /somevendor\/unaudited:1\.2/);
+});
+
+test("image-licenses RED: an undeclared Dockerfile FROM pin reds", () => {
+  const base = "FROM mcr.microsoft.com/playwright:v1.56.0-noble AS bot-builder";
+  const injected = `FROM somevendor/unaudited:1.2 AS review-probe\n${base}`;
+  const r = withEdited(LITE, base, injected, () => runGate("image-licenses"));
+  assert.equal(r.green, false, "an undeclared Dockerfile FROM image pin sailed through");
+  assert.match(r.out, /undeclared pinned image/);
+  assert.match(r.out, /somevendor\/unaudited:1\.2/);
+});
+
+test("runtime-parity RED: the bare `apt install` form (not just apt-get) is caught too", () => {
+  // A contributor who writes `apt install redis-server` (no -get) must not bypass the #636 guard.
+  const inject = "RUN apt install -y redis-server\nFROM mcr.microsoft.com/playwright:v1.56.0-noble AS final";
+  const r = withEdited(LITE, "FROM mcr.microsoft.com/playwright:v1.56.0-noble AS final", inject,
+    () => runGate("runtime-parity"));
+  assert.equal(r.green, false, "`apt install redis-server` (no -get) bypassed the parity guard");
+  assert.match(r.out, /lite/);
+  assert.match(r.out, /XAUTOCLAIM/);
+});
+
+// ── fixtures never write the checkout ────────────────────────────────────────────────────────────
+// node --test runs test FILES in parallel, and other files run gates over the real tree (for
+// example publish-edge.test.mjs runs gate:config-contract and expects it green). A fixture written
+// into the checkout reds them whenever their read lands inside its window, which CI's three-wide
+// file concurrency hit on every run. So every fixture here lives in this file's private copy.
+test("a fixture is visible to the gate it runs, and never to the checkout other test files read", () => {
+  const entry = readFileSync(join(ROOT, LITE_ENTRYPOINT), "utf8");
+  const seen = withEdited(LITE_ENTRYPOINT, "\nexport ", "\nexport VEXA_PHANTOM_ENTRY=1\nexport ", () => ({
+    checkout: readFileSync(join(ROOT, LITE_ENTRYPOINT), "utf8"),
+    gate: runGate("config-contract"),
+  }));
+  assert.equal(seen.checkout, entry, "the edit stays out of the checkout");
+  assert.equal(seen.gate.green, false, "and the gate still reads it");
+  const planted = withPlanted(PROD_FILE, POOL_LITERALS, () => ({ checkout: existsSync(join(ROOT, PROD_FILE)), gate: runDbBudget() }));
+  assert.equal(planted.checkout, false, "a planted file stays out of the checkout");
+  assert.equal(planted.gate.green, false, "and the gate still reads it");
 });

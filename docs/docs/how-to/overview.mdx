@@ -6,6 +6,10 @@ description: "Task-oriented recipes, split by which plane they touch — meeting
 Each guide is a complete path to one outcome. They assume you've finished the
 [Quickstart](/quickstart) and have an `$API_BASE` and `$API_KEY` ([Authentication](/authentication)).
 
+**Don't have a key yet?** Hosted: sign in at [vexa.ai/signin](https://vexa.ai/signin) with a Google
+account and copy your key from [your account page](https://vexa.ai/account) — free credit, no card
+required. Self-hosted: `make all` prints a key when the stack comes up.
+
 The guides fall into three chapters by the plane they work on. **Meetings** and **agents** are
 [separate domains](/index), each usable on its own; the third chapter is where they compose.
 
@@ -23,8 +27,14 @@ Capture and access meetings through the [Meetings API](/api/meetings) — no age
   <Card title="Stream a transcript over WebSocket" icon="bolt" href="/how-to/stream-transcript">
     Per-segment push instead of polling.
   </Card>
+  <Card title="Use a custom STT endpoint" icon="microphone" href="/how-to/custom-stt">
+    Point meeting transcription at your own OpenAI-compatible ASR service.
+  </Card>
   <Card title="Retrieve a recording" icon="circle-play" href="/how-to/recordings">
     List recordings and stream the audio from your own storage.
+  </Card>
+  <Card title="Automate summaries with n8n" icon="diagram-project" href="/n8n">
+    Calendar to bot to transcript to Slack — no backend to write or host.
   </Card>
 </CardGroup>
 

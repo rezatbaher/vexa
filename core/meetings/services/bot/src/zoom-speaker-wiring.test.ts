@@ -5,9 +5,30 @@
  * exact file the bot injects via addInitScript) and the REAL startCaptureBridge
  * wiring against a fake Playwright Page whose exposeFunction/evaluate run
  * in-process. Scripted Zoom active-speaker DOM transitions must cross the
- * boundary as speaker hints — name, epoch-ms timestamp, order, and turn-close
- * (isEnd) intact — arriving at the pipeline's recordHint seam (which the mixed
- * lane labels 'dom-active', Zoom's true kind — pipeline.ts).
+ * boundary — name, epoch-ms timestamp, order, and turn-close (isEnd) intact.
+ *
+ * ── WHICH SEAM, and why this test moved ──────────────────────────────────────
+ * It used to assert the transitions arrive at `BotPipeline.recordHint`, "which
+ * the mixed lane labels 'dom-active'". That is no longer true for Zoom: Zoom now
+ * captures PER-TRACK and rides the per-channel engine, whose pipeline implements
+ * `recordHint() { /* not the gmeet lane *\/ }` — a no-op (pipeline.ts). The test
+ * kept passing only because it injects its own spy pipeline, so it was guarding a
+ * seam production discards. Same defect the author found and fixed in
+ * csrc-wiring.test.ts (commit 389dfa20); this is its sibling.
+ *
+ * The two seams Zoom ACTUALLY uses, and what is asserted here now:
+ *   1. the page-side RESOLVER (`__vexaTrackNamer.onSpeak` — @vexa/zoom-capture's
+ *      createTrackNameResolver): the naming consumer, page-side, before the audio
+ *      crosses at all;
+ *   2. the TELEMETRY hint tee (`captureHint`): what a tape carries, and the hop
+ *      the clock guard re-stamps.
+ * The `recordHint` arrival is still observed — the bridge does call it — but it is
+ * now asserted as what it is: a hop the Zoom pipeline drops on the floor.
+ *
+ * Also pinned here, because they are per-track wiring facts nothing else covers:
+ *   3. stream PRESENCE reaches the aloneness tap (#1195 — a lane that never
+ *      reports presence silently removes its platform from the deaf-capture guard);
+ *   4. the lane's typed OBSERVATIONS cross as data, not as log lines (P18).
  *
  * RED at any base where the bundle lacks @vexa/zoom-capture or the zoom branch
  * of the bridge doesn't start the watcher: zero arrivals.
@@ -19,6 +40,8 @@ import path from 'node:path';
 import { startCaptureBridge } from './capture-bridge.js';
 import type { Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
+import type { RemoteAudioActivityTap } from './aloneness.js';
+import type { TelemetrySink } from './telemetry.js';
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail?: string) => {
@@ -67,11 +90,27 @@ const realClearInterval = globalThis.clearInterval;
 (g as any).clearInterval = () => { /* controlled clock */ };
 g.window = g;   // the bundle hangs VexaBrowserUtils on window too
 
+// Two remote participant streams, both live — the per-track lane's input, and the presence oracle's.
+const remoteStream = (id: string) => ({ id, getAudioTracks: () => [{ id: `${id}-a`, readyState: 'live', muted: false }] });
+g.__vexaCapturedRemoteAudioStreams = [remoteStream('stream-1'), remoteStream('stream-2')];
+// The per-track tap's AudioContext: enough surface for one source + one processor per track.
+(g as any).AudioContext = class {
+  destination = {};
+  resume(): void { /* no-op */ }
+  close(): void { /* no-op */ }
+  createMediaStreamSource(): unknown { return { connect: () => { /* */ }, disconnect: () => { /* */ } }; }
+  createScriptProcessor(): unknown {
+    return { onaudioprocess: null, connect: () => { /* */ }, disconnect: () => { /* */ } };
+  }
+};
+
 // Load the REAL bundle — defines globalThis.VexaBrowserUtils.
 new Function(readFileSync(BUNDLE, 'utf8'))();
 const utils = g.VexaBrowserUtils as Record<string, unknown> | undefined;
 check('bundle: window.VexaBrowserUtils.createZoomSpeakers is exported (RED at base — brick not bundled)',
   typeof utils?.createZoomSpeakers === 'function', `keys: ${Object.keys(utils ?? {}).join(',')}`);
+check('bundle: window.VexaBrowserUtils.createTrackNameResolver is exported (the namer is a MODULE, not a page literal)',
+  typeof utils?.createTrackNameResolver === 'function', `keys: ${Object.keys(utils ?? {}).join(',')}`);
 
 // ── Fake Playwright Page: exposeFunction hangs the Node fn on the page global (same
 //    name Playwright binds); evaluate runs the callback in-process over those shims. ──
@@ -80,7 +119,9 @@ const page = {
   async evaluate(fn: (arg: never) => unknown, arg?: unknown): Promise<unknown> { return fn(arg as never); },
 } as never;
 
-// ── Node side: the pipeline seam the hints must reach ──
+// ── Node side: every seam the transitions could reach ──
+// recordHint: the bridge calls it, and the REAL Zoom pipeline throws it away — kept so the hop is
+// observable, no longer asserted as the seam that names anything.
 const hints: Array<{ name: string; tMs: number; isEnd: boolean }> = [];
 const pipeline: BotPipeline = {
   async start() { /* not driven */ },
@@ -89,10 +130,41 @@ const pipeline: BotPipeline = {
   feedMixedAudio() { /* not driven */ },
   recordHint: (name, tMs, isEnd) => hints.push({ name, tMs, isEnd: !!isEnd }),
 };
+const captured: Array<{ name: string; t: number; isEnd?: boolean }> = [];
+const observations: Array<{ source: string; observation: Record<string, unknown> }> = [];
+const telemetry = {
+  captureFrame: () => {},
+  captureHint: (h: { name: string; t: number; isEnd?: boolean }) => captured.push(h),
+  captureObservation: (o: { source: string; observation: Record<string, unknown> }) => observations.push(o),
+} as unknown as TelemetrySink;
+const presence: number[] = [];
+const activity = {
+  observeRemoteEnergy: () => {},
+  ready: () => { /* not driven */ },
+  unavailable: () => { /* not driven */ },
+  observeStreamPresence: (n: number) => presence.push(n),
+} as unknown as RemoteAudioActivityTap;
 const inv = { platform: 'zoom', botName: 'Vexa Bot', connectionId: 'test' } as unknown as Invocation;
 
+const realDateNow = Date.now;
+const realPerformance = globalThis.performance;
+const epoch = realDateNow();
+let elapsedMs = 0;
+Date.now = () => epoch + elapsedMs;
+Object.defineProperty(globalThis, 'performance', { configurable: true, value: { now: () => elapsedMs } });
 const t0 = Date.now();
-const stop = await startCaptureBridge(page, inv, pipeline);
+const stop = await startCaptureBridge(page, inv, pipeline, telemetry, undefined, activity);
+
+// The resolver the bridge built from the bundle — wrap it to observe what reaches it, delegating so
+// the real algorithm still runs.
+const resolver = g.__vexaTrackNamer as { onSpeak: (n: string | null, t: number, e: boolean) => void } | undefined;
+const spoken: Array<{ name: string | null; tMs: number; isEnd: boolean }> = [];
+if (resolver) {
+  const inner = resolver.onSpeak.bind(resolver);
+  resolver.onSpeak = (name, tMs, isEnd) => { spoken.push({ name, tMs, isEnd }); inner(name, tMs, isEnd); };
+}
+check('the per-track lane built the resolver from the bundle (not a literal in the bridge)', !!resolver);
+
 const tick = (n: number) => { for (const cb of [...intervals]) for (let i = 0; i < n; i++) cb(); };
 
 // ── N scripted transitions across the boundary (CONFIRM_POLLS=2 debounce) ──
@@ -101,28 +173,93 @@ setSpeaker('Bob');    tick(2);
 setSpeaker('Carol');  tick(2);
 setSpeaker(null);     tick(2);   // nobody lit → the open turn closes (isEnd)
 
-const starts = hints.filter((h) => !h.isEnd).map((h) => h.name);
-check('boundary: all 3 scripted transitions arrived node-side, in order (RED at base — zero arrivals)',
-  JSON.stringify(starts) === JSON.stringify(['Alice', 'Bob', 'Carol']), JSON.stringify(hints));
-check('boundary: nobody-lit closes the last turn (isEnd for Carol)',
-  hints.some((h) => h.isEnd && h.name === 'Carol'), JSON.stringify(hints));
-check('boundary: timestamps are epoch ms (the Node clock), non-decreasing',
-  hints.every((h) => h.tMs >= t0 && h.tMs <= Date.now()) &&
-  hints.every((h, i) => i === 0 || h.tMs >= hints[i - 1].tMs));
-check('boundary: the seam reached is BotPipeline.recordHint — the mixed lane labels it \'dom-active\' (pipeline.ts)',
-  hints.length > 0);
+// 1. THE NAMING SEAM ON THIS LANE — the page-side resolver, before any audio crosses.
+const spokenStarts = spoken.filter((s) => !s.isEnd).map((s) => s.name);
+check('seam 1 (resolver): all 3 scripted transitions reached the page-side namer, in order',
+  JSON.stringify(spokenStarts) === JSON.stringify(['Alice', 'Bob', 'Carol']), JSON.stringify(spoken));
+check('seam 1 (resolver): nobody-lit closes the last turn (isEnd for Carol)',
+  spoken.some((s) => s.isEnd && s.name === 'Carol'), JSON.stringify(spoken));
+
+// 2. THE TAPE — the hint tee, which is what a replay is reconstructed from.
+const capturedStarts = captured.filter((h) => !h.isEnd).map((h) => h.name);
+check('seam 2 (telemetry): the same transitions crossed to the tape, in order',
+  JSON.stringify(capturedStarts) === JSON.stringify(['Alice', 'Bob', 'Carol']), JSON.stringify(captured));
+check('seam 2 (telemetry): timestamps are epoch ms (the Node clock), non-decreasing',
+  captured.every((h) => h.t >= t0 && h.t <= Date.now()) &&
+  captured.every((h, i) => i === 0 || h.t >= captured[i - 1].t));
+
+// 3. recordHint — observed, and explicitly NOT the naming seam here.
+check('recordHint is a hop, not the seam: it receives the hints, and the Zoom pipeline discards them',
+  hints.length === captured.length, `${hints.length} vs ${captured.length}`);
+
+// 4. PRESENCE (#1195) — the lane must not silently opt Zoom out of the deaf-capture guard.
+check('presence reaches the aloneness tap — 2 live remote streams (RED before the per-track fix: never called)',
+  presence.length > 0 && presence[presence.length - 1] === 2, JSON.stringify(presence));
+
+// 5. OBSERVATIONS (P18) — the lane's shape crosses as DATA, not only as a log line.
+check('the per-track topology crossed as DATA (2 tracks captured)',
+  observations.some((o) => o.observation.type === 'pertrack-topology' && o.observation.streams === 2),
+  JSON.stringify(observations.map((o) => o.observation.type)));
 
 // A single-poll flicker must NOT cross the boundary (the debounce holds at wiring altitude).
 setSpeaker('Dave'); tick(2);
-const before = hints.length;
+const before = spoken.length;
 setSpeaker('Eve');  tick(1);    // one flicker poll
 setSpeaker('Dave'); tick(1);    // back before confirm
-check('boundary: a single-poll flicker (Eve) never crosses', !hints.slice(before).some((h) => h.name === 'Eve'),
-  JSON.stringify(hints.slice(before)));
+check('boundary: a single-poll flicker (Eve) never crosses', !spoken.slice(before).some((s) => s.name === 'Eve'),
+  JSON.stringify(spoken.slice(before)));
 
+// A processor missed callbacks for 30 minutes; the next frame must describe NOW,
+// not 256 ms after the track was attached. Exercise both tracks at the real seam.
+const frameTimes: number[] = [];
+const originalFeed = pipeline.feedAudio;
+pipeline.feedAudio = (_ch, _name, _pcm, ts) => { frameTimes.push(ts); };
+const caps = (g.__vexaTrackCaps as Map<string, any>);
+const input = new Float32Array(4096).fill(0.1);
+for (const delay of [256, 1800000, 1800256]) {
+  elapsedMs = delay;
+  for (const cap of caps.values()) cap.proc.onaudioprocess({ inputBuffer: { getChannelData: () => input } });
+  const latest = frameTimes.slice(-2);
+  check('delayed callbacks preserve current frame start on both tracks at ' + delay,
+    latest.length === 2 && latest.every(ts => Math.abs(ts - (epoch + delay - 256)) < 1), JSON.stringify(latest));
+}
+check('missed callbacks are reported as capture-clock-gap observations',
+  observations.filter(o => o.observation.type === 'capture-clock-gap').length === 2);
+// Wall-clock corrections must not move the audio clock backwards.
+Date.now = () => epoch - 60000;
+elapsedMs = 1800512;
+for (const cap of caps.values()) cap.proc.onaudioprocess({ inputBuffer: { getChannelData: () => input } });
+check('wall-clock adjustment does not jump the capture timeline',
+  frameTimes.slice(-2).every(ts => ts === epoch + elapsedMs - 256));
+// Replay the committed long-call schedule through the real per-track callbacks.
+const fixture = JSON.parse(readFileSync(new URL('./fixtures/zoom-clock.json', import.meta.url), 'utf8'));
+Date.now = () => epoch + elapsedMs;
+for (let n = 3; n <= fixture.tracks; n++) (g.__vexaCapturedRemoteAudioStreams as any[]).push(remoteStream('stream-' + n));
+tick(1);
+const fixturePcm = new Float32Array(fixture.frameSamples).fill(fixture.pcmAmplitude);
+const frameMs = fixture.frameSamples / fixture.sampleRate * 1000;
+const callbackEveryMs = frameMs / fixture.deliveredAudioRatio;
+const replayStart = elapsedMs;
+let maxErrorMs = 0;
+let replayedFrames = 0;
+pipeline.feedAudio = (_ch, _name, _pcm, ts) => {
+  maxErrorMs = Math.max(maxErrorMs, Math.abs(ts - (epoch + elapsedMs - frameMs)));
+  replayedFrames++;
+};
+for (let t = callbackEveryMs; t <= fixture.wallDurationMs; t += callbackEveryMs) {
+  elapsedMs = replayStart + t;
+  for (const cap of caps.values()) cap.proc.onaudioprocess({ inputBuffer: { getChannelData: () => fixturePcm } });
+}
+check('one-hour eight-track 0.43x fixture has no cumulative clock drift',
+  caps.size === fixture.tracks && replayedFrames > 40000 && maxErrorMs < 1,
+  JSON.stringify({ tracks: caps.size, replayedFrames, maxErrorMs }));
+console.log(JSON.stringify({ receipt: 'zoom-clock-fixture', tracks: caps.size, wallDurationMs: fixture.wallDurationMs, replayedFrames, maxErrorMs }));
+pipeline.feedAudio = originalFeed;
 await stop();
+Date.now = realDateNow;
+Object.defineProperty(globalThis, 'performance', { configurable: true, value: realPerformance });
 (g as any).setInterval = realSetInterval;
 (g as any).clearInterval = realClearInterval;
 
 if (failed) { console.error(`\n❌ zoom-speaker-wiring: ${failed} checks FAILED.`); process.exit(1); }
-console.log('\n✅ zoom-speaker-wiring: real bundle + real bridge carry Zoom active-speaker transitions page→Node (order, epoch-ms timestamps, isEnd, flicker debounce).');
+console.log('\n✅ zoom-speaker-wiring: real bundle + real bridge carry Zoom active-speaker transitions page→Node to the seams the per-track lane actually uses (resolver, tape, presence, typed observations).');

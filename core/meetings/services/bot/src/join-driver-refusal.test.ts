@@ -31,9 +31,10 @@ async function main() {
     const page = pageWithRefusals();
     const driver = createBrowserJoinDriver(page, invocation);
     const states: string[] = [];
-    assert.equal(await driver.join(async state => { states.push(state); }), "rejected");
+    const result = await driver.join(async state => { states.push(state); });
+    assert.equal(result.outcome, "rejected");
     assert.equal(page.count(), 3);
-    assert.ok(driver.failureReason?.()?.startsWith("google_meet_join_refused:"));
+    assert.ok(result.reason?.startsWith("google_meet_join_refused:"));
     assert.deepEqual(states, []);
   }
   {

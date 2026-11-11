@@ -10,7 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
+
+import pytest
+
+from gateway import CARRIED_DOMAINS
 
 # fastapi-guard: keep it installed (so the integration is exercised) but in-memory and with
 # rate limiting off, so the unit suite never depends on Redis and guard can never throttle/
@@ -19,6 +24,26 @@ from typing import Optional
 os.environ.setdefault("GUARD_ENABLED", "true")
 os.environ.setdefault("GUARD_ENABLE_REDIS", "false")
 os.environ.setdefault("GUARD_RATE_LIMIT_RPM", "0")
+
+# ── WHICH PROFILE IS THIS BUILD? ────────────────────────────────────────────────────────────────
+#
+# The edge fronts the domains this BUILD carries a route manifest for, and not every build carries
+# five: the open-core product is generated without the agent surface, so `core/agent/routes.v1.json`
+# is not on disk there and the edge fronts four. `gateway.CARRIED_DOMAINS` is that fact, read from
+# the same assembly the app itself is built from.
+#
+# Tests that assert the AGENT half of the edge are marked `needs_agent`. In a build that ships it
+# they run exactly as they always have; in a build that does not, pytest reports them SKIPPED and
+# prints the reason. That distinction is the whole point of the marker: an assertion about a surface
+# this build does not have must be visibly absent, never quietly true. Assertions that are still
+# meaningful without the agent domain are NOT marked — they derive their expectation from
+# `CARRIED_DOMAINS` instead, and keep asserting an exact table.
+AGENT_CARRIED = "agent" in CARRIED_DOMAINS
+needs_agent = pytest.mark.skipif(
+    not AGENT_CARRIED,
+    reason="this build ships no core/agent/routes.v1.json, so the edge fronts four domains and "
+           "there is no /agent surface to assert (gateway.CARRIED_DOMAINS)",
+)
 
 VALID_KEY = "vxa_test_unit_key"
 VALID_USER = {"user_id": 7, "scopes": ["bot", "tx", "browser"], "max_concurrent": 3, "email": "u@example.com"}
@@ -89,6 +114,25 @@ class FakeDownstream:
                      "params": params, "content": content}
         for chunk in self._stream_chunks:
             yield chunk
+
+    @asynccontextmanager
+    async def open_stream(self, method, url, *, headers=None, params=None, content=None):
+        """The head-aware streaming forward (``ports.StreamedResponse``): status + headers first,
+        then the canned chunks. Used by the relay leg (MCP), where the upstream's own verdict must
+        reach the caller instead of a gateway-minted envelope."""
+        self.last = {"method": method, "url": url, "headers": headers or {},
+                     "params": params, "content": content}
+        chunks = self._stream_chunks
+
+        class _Streamed:
+            status_code = self.status_code
+            headers = {"content-type": self._content_type, **self._extra_headers}
+
+            async def aiter_bytes(_self):
+                for chunk in chunks:
+                    yield chunk
+
+        yield _Streamed()
 
 
 class FakePubSub:

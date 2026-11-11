@@ -12,7 +12,9 @@
 #                      validate-harness fix is testable BEFORE it merges to main
 #
 #   resolve         version well-formed · every published manifest resolves + carries linux/amd64
-#                   (and linux/arm64 for matrix images except vexa-bot)
+#                   (and linux/arm64 for matrix images except vexa-bot) · plus the packet-bound
+#                   candidate-map identity, enforced on every promote / stable / already-mapped
+#                   version and deferred-with-a-notice in the freeze window (#1237)
 #   image-identity  every published image CONTAINS what its NAME promises — runs in PARALLEL
 #                   with the validate legs (all consume the same published bytes); it gates
 #                   PROMOTE, not the validate verdict, so it no longer sits serially between
@@ -45,6 +47,16 @@ on:
         required: false
         default: false
         type: boolean
+      promote_repository:
+        description: "Alias all frozen repositories, or one exact owner/name repair target"
+        required: false
+        default: all
+        type: string
+      validation_leg:
+        description: "Validation scope: all, or compose for an isolated harness rerun"
+        required: false
+        default: all
+        type: string
     secrets:
       DOCKERHUB_USERNAME:
         required: true
@@ -66,6 +78,32 @@ on:
         required: false
         default: false
         type: boolean
+      promote_repository:
+        description: "Alias scope"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - vexaai/v012-admin-api
+          - vexaai/v012-runtime
+          - vexaai/v012-agent-worker
+          - vexaai/v012-agent-api
+          - vexaai/v012-meeting-api
+          - vexaai/v012-gateway
+          - vexaai/v012-mcp
+          - vexaai/v012-terminal
+          - vexaai/v012-flows
+          - vexaai/vexa-bot
+          - vexaai/vexa-lite
+      validation_leg:
+        description: "Validation scope"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - compose
 
 permissions:
   contents: read
@@ -81,6 +119,7 @@ env:
     vexaai/v012-gateway
     vexaai/v012-mcp
     vexaai/v012-terminal
+    vexaai/v012-flows
     vexaai/vexa-bot
     vexaai/vexa-lite
 
@@ -90,12 +129,25 @@ jobs:
   # with linux/amd64 (all images) and linux/arm64 (matrix images except vexa-bot). Everything
   # downstream fans out from here IN PARALLEL — nothing heavier stands between "validate
   # requested" and the first validate leg starting.
+  #
+  # Two checks live here and they are NOT the same check (#1237):
+  #   floor    — version-agnostic: every published manifest resolves with its required platforms.
+  #              Unconditional; a red here means the set is not published as claimed.
+  #   identity — the packet-bound candidate map (a human-reviewed sha256 pinned in the table
+  #              below). Enforced on every promote, every stable version, and every version a
+  #              committed map already names; DEFERRED WITH A LOUD NOTICE only in the freeze
+  #              window, where the map records digests the build has only just published and so
+  #              cannot exist yet. The deferral is rendered in the guarantee block.
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      # 'true' when this run PROVED the packet-bound candidate-map identity; 'false' when it
+      # deferred it (see the identity step). The guarantee block renders the difference — a
+      # deferral that does not reach the notes is the silent skip this gate exists to prevent.
+      identity_verified: ${{ steps.identity.outputs.enforce }}
     steps:
       - name: Resolve the version under validation
         id: version
@@ -110,19 +162,29 @@ jobs:
           if [ "$BARE" != "$BASE" ]; then PRE=true; else PRE=false; fi
           { echo "version=$VERSION"; echo "prerelease=$PRE"; } >> "$GITHUB_OUTPUT"
           echo "✓ validating published set $VERSION (prerelease=$PRE)"
+      - uses: actions/checkout@v4
+      - name: Registry validator controls
+        run: node --test scripts/registry-candidate-validate.test.mjs
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── the always-on floor (restored, #1237) ────────────────────────────────────────────────
+      # This job's contract — stated in its own header and in delivery.mdx — is "every published
+      # manifest resolves and carries the platforms it claims". #949 REPLACED that version-agnostic
+      # check with the version-pinned map check below, which silently narrowed the floor to nothing
+      # for any version not in the table. The floor is back, and it is unconditional: it holds for
+      # every version, reviewed or not, and it is what makes a deferred identity check safe.
+      #
+      # `imagetools inspect` prints no Platform line for classic-driver (schema-v2) manifests even
+      # when the registry descriptor says linux/amd64 — the bot image is built on the classic driver
+      # by design, so read the registry descriptor instead; it is authoritative for both shapes.
       - name: Every published manifest resolves and carries required platforms
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          # `imagetools inspect` prints no Platform line for classic-driver (schema-v2)
-          # manifests even when the registry descriptor says linux/amd64 — the bot image
-          # is built on the classic driver by design, so read the registry descriptor
-          # instead; it is authoritative for both manifest shapes.
           for img in $ALL_IMAGES; do
             echo "== $img:$VERSION"
             # NOTE: a `IMG=... cmd | python3` prefix binds the var only to the first
@@ -147,6 +209,167 @@ jobs:
           done
           echo "✓ all $(wc -w <<<"$ALL_IMAGES") manifests present with required platforms"
 
+      # ── packet-bound candidate-map identity: when it is enforced, and when it is deferred ─────
+      # The table below is a REVIEW RECORD, not data: a human read that version's committed
+      # candidate map and pinned its sha256 here. A version can only reach the table AFTER its
+      # images exist, because the map records the digests the build published. So at FREEZE time —
+      # the tag-push build that publishes a new rc — the identity is not merely unreviewed, it is
+      # UNKNOWABLE. Failing there made every successful rc freeze conclude FAILURE by construction
+      # (#1237: identical on rc.14/15/16/17/18, all of which published all ten images).
+      #
+      # Deferral is allowed on exactly one shape, and it is announced loudly:
+      #   prerelease  AND  promote:false  AND  no reviewed arm  AND  no committed map naming this
+      #   version  →  identity verification deferred to the standalone release-validate dispatch.
+      # Everything else fails closed, unchanged:
+      #   · any promote request                → the moving tag never moves on an unreviewed map
+      #   · any stable (non-prerelease) version → the witnessed/aliased candidate must be reviewed
+      #   · any version a committed map already names → identity is KNOWABLE, so it must be reviewed
+      # The floor above still runs in every case, and `promote` carries its own independent
+      # stable-promotion map-identity table further down. This gate is defence in depth, not the
+      # only wall between an unreviewed image and prod.
+      - name: Resolve the packet-bound candidate-map identity
+        id: identity
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          PROMOTE: ${{ inputs.promote }}
+        run: |
+          set -euo pipefail
+          CANDIDATE_MAP=""
+          EXPECTED_MAP_STABLE_TAG=""
+          EXPECTED_MAP_SHA256=""
+          EXPECTED_TOP_DESCRIPTORS=""
+          EXPECTED_PLATFORM_IDENTITIES=""
+          REVIEWED=true
+          case "$VERSION" in
+            v0.12.18)
+              CANDIDATE_MAP=releases/v0.12.18/candidate-images.json
+              EXPECTED_MAP_STABLE_TAG=v0.12.18
+              EXPECTED_MAP_SHA256=80fe23246f94557279b4da2792119489f7c60f8e452b83de2c1c33ef48ebd03f
+              EXPECTED_TOP_DESCRIPTORS=10
+              EXPECTED_PLATFORM_IDENTITIES=19
+              ;;
+            v0.12.28-rc.5|v0.12.28)
+              CANDIDATE_MAP=releases/v0.12.28/candidate-images.json
+              EXPECTED_MAP_STABLE_TAG=v0.12.28
+              EXPECTED_MAP_SHA256=4f35cf6205a9f01b3acd22a27579dbab48411ad05bb5c80c1b9ec1f919d75431
+              EXPECTED_TOP_DESCRIPTORS=11
+              EXPECTED_PLATFORM_IDENTITIES=21
+              ;;
+            v0.12.27-rc.5|v0.12.27)
+              CANDIDATE_MAP=releases/v0.12.27/candidate-images.json
+              EXPECTED_MAP_STABLE_TAG=v0.12.27
+              EXPECTED_MAP_SHA256=5dfc6f51c2b2cde6ba0f152b06de0ae35624c09e8ad159b3555cd92c6674178d
+              EXPECTED_TOP_DESCRIPTORS=11
+              EXPECTED_PLATFORM_IDENTITIES=21
+              ;;
+            v0.12.26-rc.1|v0.12.26)
+              CANDIDATE_MAP=releases/v0.12.26/candidate-images.json
+              EXPECTED_MAP_STABLE_TAG=v0.12.26
+              EXPECTED_MAP_SHA256=91e5d99e0b1c801902a2da3b7f4f5b4f78a23339a30ca87311cee81f4639477f
+              EXPECTED_TOP_DESCRIPTORS=10
+              EXPECTED_PLATFORM_IDENTITIES=19
+              ;;
+            v0.12.25-rc.1|v0.12.25)
+              CANDIDATE_MAP=releases/v0.12.25/candidate-images.json
+              EXPECTED_MAP_STABLE_TAG=v0.12.25
+              EXPECTED_MAP_SHA256=d9d0cdd13623cb1a9b3772adff271b2b1b0aa457c11a7286cfb13655d813b289
+              EXPECTED_TOP_DESCRIPTORS=10
+              EXPECTED_PLATFORM_IDENTITIES=19
+              ;;
+            v0.12.23-rc.21|v0.12.23)
+              CANDIDATE_MAP=releases/v0.12.23/candidate-images.json
+              EXPECTED_MAP_STABLE_TAG=v0.12.23
+              EXPECTED_MAP_SHA256=c5a310465b9005573c9fef79534e34a7822447d6c7004f24271ed59df61fe2a6
+              EXPECTED_TOP_DESCRIPTORS=10
+              EXPECTED_PLATFORM_IDENTITIES=19
+              ;;
+            *)
+              REVIEWED=false
+              ;;
+          esac
+
+          # Is a committed map already claiming this exact version? Then the identity is knowable
+          # and an unreviewed run must fail closed — deferral covers only the freeze window in
+          # which no map can exist yet.
+          BARE="${VERSION#v}"; BASE="${BARE%%-*}"
+          COMMITTED_MAP="releases/v$BASE/candidate-images.json"
+          MAP_CLAIMS_VERSION=false
+          if [ -f "$COMMITTED_MAP" ]; then
+            CLAIMED_TAGS="$(node -e '
+              const { readFileSync } = require("node:fs");
+              const map = JSON.parse(readFileSync(process.argv[1], "utf8"));
+              console.log([map.candidate_tag || "-", map.stable_tag || "-"].join(" "));
+            ' "$COMMITTED_MAP")"
+            for tag in $CLAIMED_TAGS; do
+              if [ "$tag" = "$VERSION" ]; then MAP_CLAIMS_VERSION=true; fi
+            done
+          fi
+
+          ENFORCE=true
+          REASON="$VERSION has a reviewed, packet-bound candidate-map identity"
+          if [ "$REVIEWED" != "true" ]; then
+            if [ "$PROMOTE" = "true" ]; then
+              REASON="a promote was requested"
+            elif [ "$PRERELEASE" != "true" ]; then
+              REASON="$VERSION is a stable version (witnessed/aliased candidates are always reviewed)"
+            elif [ "$MAP_CLAIMS_VERSION" = "true" ]; then
+              REASON="$COMMITTED_MAP already names $VERSION, so its identity is knowable"
+            else
+              ENFORCE=false
+            fi
+          fi
+
+          if [ "$ENFORCE" = "true" ] && [ "$REVIEWED" != "true" ]; then
+            echo "::error ::$VERSION has no reviewed, packet-bound candidate-map identity — required here because $REASON. Bind the candidate packet (releases/v$BASE/candidate-images.json) and pin its sha256 in this workflow's resolve table; see releases/README.md § Bind, validate, freeze."
+            exit 1
+          fi
+
+          {
+            echo "CANDIDATE_MAP=$CANDIDATE_MAP"
+            echo "EXPECTED_MAP_STABLE_TAG=$EXPECTED_MAP_STABLE_TAG"
+            echo "EXPECTED_MAP_SHA256=$EXPECTED_MAP_SHA256"
+            echo "EXPECTED_TOP_DESCRIPTORS=$EXPECTED_TOP_DESCRIPTORS"
+            echo "EXPECTED_PLATFORM_IDENTITIES=$EXPECTED_PLATFORM_IDENTITIES"
+          } >> "$GITHUB_ENV"
+          echo "enforce=$ENFORCE" >> "$GITHUB_OUTPUT"
+          if [ "$ENFORCE" = "true" ]; then
+            echo "✓ enforcing packet-bound identity for $VERSION ($CANDIDATE_MAP)"
+          else
+            echo "· $VERSION has no committed candidate map yet — identity verification deferred"
+          fi
+
+      - name: Every frozen descriptor resolves through authenticated registry reads
+        if: steps.identity.outputs.enforce == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/registry-candidate-validate.mjs \
+            --candidate-map "$CANDIDATE_MAP" \
+            --tag "$VERSION" \
+            --expected-map-stable-tag "$EXPECTED_MAP_STABLE_TAG" \
+            --expected-map-sha256 "$EXPECTED_MAP_SHA256" \
+            --expected-top-descriptors "$EXPECTED_TOP_DESCRIPTORS" \
+            --expected-platform-identities "$EXPECTED_PLATFORM_IDENTITIES"
+
+      # A skip nobody can see is the same defect as a red nobody can trust. This run's conclusion
+      # says the images published and the legs passed; this notice says what it did NOT prove.
+      - name: Identity verification deferred — say so, loudly
+        if: steps.identity.outputs.enforce != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          MSG="**${VERSION}: packet-bound candidate-map identity NOT verified in this run.** No candidate map names ${VERSION} yet — the map records the digests this build just published, so its identity is not knowable at freeze time. Verification is DEFERRED to the standalone \`release-validate\` dispatch that runs after the packet is bound and its sha256 pinned in the resolve table (releases/README.md § Bind, validate, freeze). This run proves the published manifests resolve with their required platforms and that every validation leg passes on the published bytes. Promote and stable-tag paths remain fail-closed and cannot run on a deferred identity."
+          echo "::notice title=candidate-map identity DEFERRED::$MSG"
+          {
+            echo "> ⚠️ $MSG"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ──────────────────────────────────────────────────────────────────────────────────────────
   # Image-identity smoke — a dumb, loud assertion that every published image CONTAINS what its
   # NAME promises. Catches a matrix entry pointing at the wrong Dockerfile, a cross-tagged push,
@@ -155,6 +378,7 @@ jobs:
   # Runs in PARALLEL with the validate legs; it gates promote, not the validate signal.
   image-identity:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -196,6 +420,7 @@ jobs:
               vexaai/v012-gateway)      probe "$ref" python -c "import gateway" ;;
               vexaai/v012-mcp)          probe "$ref" python -c "import vexa_mcp" ;;
               vexaai/v012-terminal)     probe "$ref" node -e "require('fs').accessSync('/app/server.mjs')" ;;
+              vexaai/v012-flows)        probe "$ref" python -c "import flows_worker, importlib.util as u; assert u.find_spec('flows_integrations.flows_api')" ;;
               vexaai/vexa-bot)          probe "$ref" bash -c 'test -x /app/entrypoint.sh && test -f /app/browser-utils.global.js' ;;
               vexaai/vexa-lite)         probe "$ref" bash -c 'test -f /etc/supervisor/conf.d/vexa.conf && test -x /entrypoint.sh' ;;
               *)
@@ -263,6 +488,7 @@ jobs:
   # the working tree.
   validate-compose:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' || inputs.validation_leg == 'compose' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -277,7 +503,40 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       # agent-api reads deploy/compose/.env via env_file (single source of truth) — it must exist.
       - name: Seed compose .env
-        run: cp deploy/compose/.env.example deploy/compose/.env
+        run: bash deploy/compose/mint-dev-env.sh   # seeds .env and mints the keys the stack refuses to run without (0.12.27)
+      # Runtime uses the Docker Engine create API with pull disabled. Prove the daemon contract
+      # red→green here, then leave the exact published bot bytes resident for stack-test.
+      - name: Prove and preload the published bot image for runtime spawn
+        env:
+          BOT_REF: vexaai/vexa-bot:${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          RED_NAME="vexa-bot-preload-red-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          GREEN_NAME="vexa-bot-preload-green-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$RED_NAME" "$GREEN_NAME" >/dev/null 2>&1 || true' EXIT
+
+          # RED: an absent image plus Docker create --pull=never is the exact 404 class that
+          # validate-compose previously observed through runtime.
+          docker image rm -f "$BOT_REF" >/dev/null 2>&1 || true
+          if docker create --pull=never --name "$RED_NAME" "$BOT_REF" \
+              >/tmp/vexa-bot-preload-red.out 2>/tmp/vexa-bot-preload-red.err; then
+            echo "::error title=bot-preload-red::Docker create unexpectedly succeeded without a local $BOT_REF"
+            exit 1
+          fi
+          grep -Eq 'No such image|not found locally' /tmp/vexa-bot-preload-red.err \
+            || { cat /tmp/vexa-bot-preload-red.err; echo "::error title=bot-preload-red::expected the absent-image 404 class"; exit 1; }
+          echo "✓ red control: Docker create cannot spawn absent $BOT_REF with pull disabled"
+
+          # GREEN: pull once, create with pull still disabled, and assert Docker attached the
+          # container to the exact local image ID resolved from the published reference.
+          docker pull "$BOT_REF"
+          EXPECTED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$BOT_REF")"
+          REPO_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$BOT_REF")"
+          GREEN_CID="$(docker create --pull=never --name "$GREEN_NAME" "$BOT_REF")"
+          ACTUAL_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$GREEN_CID")"
+          test "$ACTUAL_IMAGE_ID" = "$EXPECTED_IMAGE_ID" \
+            || { echo "::error title=bot-preload-green::spawn imageID $ACTUAL_IMAGE_ID != pulled imageID $EXPECTED_IMAGE_ID"; exit 1; }
+          echo "✓ green control: $REPO_DIGEST preloaded; Docker create used imageID $ACTUAL_IMAGE_ID"
       # The compose agent-worker service is a build-only profile — `up`/`pull` skip it, and the
       # runtime spawns workers through the docker socket API. Pre-pull the PUBLISHED worker image so
       # the runtime's presence check finds it and this leg exercises the published worker bytes.
@@ -298,6 +557,7 @@ jobs:
 
   validate-mock-fsm:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -311,7 +571,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Seed compose .env
-        run: cp deploy/compose/.env.example deploy/compose/.env
+        run: bash deploy/compose/mint-dev-env.sh   # seeds .env and mints the keys the stack refuses to run without (0.12.27)
       - name: Build the mock bot (local instrument image, never published)
         run: docker build -f core/meetings/services/bot/Dockerfile.mock -t mock-bot:dev .
       # See validate-compose: the build-only agent-worker profile is never pulled by compose itself.
@@ -336,6 +596,7 @@ jobs:
   # failure (a compat surface regressing, or a recorded break silently un-breaking) turns this red.
   validate-v010-compat:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -349,7 +610,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Seed compose .env
-        run: cp deploy/compose/.env.example deploy/compose/.env
+        run: bash deploy/compose/mint-dev-env.sh   # seeds .env and mints the keys the stack refuses to run without (0.12.27)
       - name: Build the mock bot (local instrument image, never published)
         run: docker build -f core/meetings/services/bot/Dockerfile.mock -t mock-bot:dev .
       # See validate-compose: the build-only agent-worker profile is never pulled by compose itself.
@@ -372,6 +633,7 @@ jobs:
 
   validate-bot-spawn:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -385,7 +647,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Seed compose .env
-        run: cp deploy/compose/.env.example deploy/compose/.env
+        run: bash deploy/compose/mint-dev-env.sh   # seeds .env and mints the keys the stack refuses to run without (0.12.27)
       # The runtime spawns bots through the docker socket API, which does NOT implicit-pull —
       # the published bot image must already be on the daemon.
       - name: Pre-pull the published bot image
@@ -409,6 +671,7 @@ jobs:
 
   validate-lite:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -468,6 +731,7 @@ jobs:
   # (concurrent-bots needs the bot image). Gates promote + guarantees with the amd64 legs.
   validate-arm64:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
@@ -514,6 +778,7 @@ jobs:
               vexaai/v012-gateway)      probe "$ref" python -c "import gateway" ;;
               vexaai/v012-mcp)          probe "$ref" python -c "import vexa_mcp" ;;
               vexaai/v012-terminal)     probe "$ref" node -e "require('fs').accessSync('/app/server.mjs')" ;;
+              vexaai/v012-flows)        probe "$ref" python -c "import flows_worker, importlib.util as u; assert u.find_spec('flows_integrations.flows_api')" ;;
               vexaai/vexa-lite)         probe "$ref" bash -c 'test -f /etc/supervisor/conf.d/vexa.conf && test -x /entrypoint.sh' ;;
               *)
                 echo "::error title=validate-arm64::no identity assertion for $img — every matrix image must state what proves its contents match its name"
@@ -546,6 +811,7 @@ jobs:
 
   validate-helm-k3s:
     needs: resolve
+    if: ${{ inputs.validation_leg == 'all' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -573,6 +839,18 @@ jobs:
           # poll until it answers, then wait for node readiness.
           for i in $(seq 1 60); do kubectl get nodes >/dev/null 2>&1 && break; sleep 5; done
           kubectl wait --for=condition=Ready node --all --timeout=300s
+      # The chart stores recordings in the operator's own S3 and runs no object store, so this leg
+      # starts one that exists only in the test: versitygw (POSIX backend, pinned by digest) with a
+      # Secret of random credentials — the Secret values-test.yaml names as storage.s3.existingSecret.
+      - name: Test-only S3 fixture
+        run: |
+          set -euo pipefail
+          kubectl create namespace vexa
+          kubectl -n vexa create secret generic s3-fixture-credentials \
+            --from-literal=AWS_ACCESS_KEY_ID="$(openssl rand -hex 10)" \
+            --from-literal=AWS_SECRET_ACCESS_KEY="$(openssl rand -hex 20)"
+          kubectl -n vexa apply -f deploy/helm/tests/s3-fixture.yaml
+          kubectl -n vexa wait --for=condition=complete job/s3-fixture-bucket --timeout=300s
       - name: helm install from published images
         run: |
           helm upgrade --install vexa deploy/helm/charts/vexa -n vexa --create-namespace \
@@ -591,12 +869,21 @@ jobs:
             exit 1
           fi
           echo "✓ gateway healthy, all pods Running"
+      - name: Recording round trip into the fixture bucket
+        run: |
+          set -euo pipefail
+          kubectl -n vexa exec -i deploy/vexa-vexa-meeting-api -c meeting-api -- \
+            env GATEWAY_URL=http://vexa-vexa-gateway:8000 python3 - all \
+            < deploy/helm/tests/recording_roundtrip.py
+          echo "✓ upload → finalize → playback → delete through the API, objects in the fixture bucket"
       - name: Cluster state on failure
         if: failure()
         run: |
           kubectl -n vexa get pods -o wide || true
           kubectl -n vexa get events --sort-by=.lastTimestamp | tail -50 || true
           kubectl -n vexa describe pods | tail -150 || true
+          kubectl -n vexa logs deploy/s3-fixture --tail=50 || true
+          kubectl -n vexa logs deploy/vexa-vexa-meeting-api --tail=100 || true
 
   # ──────────────────────────────────────────────────────────────────────────────────────────
   # The guarantee block (delivery.mdx ship bar, owner-approved canon 2026-07-13) — GENERATED
@@ -624,6 +911,7 @@ jobs:
       - name: Generate the guarantee block from leg results
         env:
           R_RESOLVE: ${{ needs.resolve.result }}
+          R_MAP_IDENTITY: ${{ needs.resolve.outputs.identity_verified }}
           R_IDENTITY: ${{ needs.image-identity.result }}
           R_COMPOSE: ${{ needs.validate-compose.result }}
           R_MOCKFSM: ${{ needs.validate-mock-fsm.result }}
@@ -645,12 +933,23 @@ jobs:
               *)          printf '❌ (%s)' "$1" ;;
             esac
           }
+          # The deferral valve (#1237). resolve may legitimately DEFER the packet-bound
+          # candidate-map identity check at freeze time — the map records digests the build
+          # just published, so it cannot exist yet. A deferral that does not reach the notes
+          # is a silent skip, which is the same defect as a red nobody can trust. Say it here.
+          map_identity() {
+            case "$R_MAP_IDENTITY" in
+              true)  printf '; packet-bound candidate-map identity verified' ;;
+              false) printf '; ⚠️ packet-bound candidate-map identity **DEFERRED** to the standalone release-validate run (no map names this candidate yet — #1237)' ;;
+              *)     printf '; packet-bound candidate-map identity — not reported' ;;
+            esac
+          }
           {
             echo "## The guarantee — $VERSION ([this run]($RUN_URL))"
             echo
             echo "| # | Guarantee | Proof in this run |"
             echo "|---|---|---|"
-            echo "| 1 | Every artifact users pull is the artifact we proved | $(m "$R_RESOLVE") manifests resolve; every leg pulls published bytes only |"
+            echo "| 1 | Every artifact users pull is the artifact we proved | $(m "$R_RESOLVE") manifests resolve$(map_identity); every leg pulls published bytes only |"
             echo "| 2 | Every documented install path stands up and is exercised to its leg's scope (NOT full end-to-end — real audio→words is row 3) | compose $(s "$R_COMPOSE" "installs + API/data-plane wiring, synthetic transcript; real bot in row 5") · FSM $(s "$R_MOCKFSM" "meeting-lifecycle FSM via mock bot, no real browser/STT") · lite $(s "$R_LITE" "front doors + ≥2 concurrent real-bot spawn, no meeting/STT assertion") · helm $(s "$R_HELM" "installs + healthy, bot/meeting/STT not exercised") |"
             echo "| 3 | Real audio → correct, speaker-attributed words | ⚠️ NOT machine-proven in this run — witness-pass only until the wav→words leg (#560) ships |"
             echo "| 4 | A fresh machine with nothing on it succeeds | ⚠️ fresh-VM leg runs outside this workflow — attach its evidence to the notes or state unclaimed |"
@@ -741,29 +1040,67 @@ jobs:
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       PROMOTE_LATEST: ${{ inputs.promote_latest == true }}
+      PROMOTE_REPOSITORY: ${{ inputs.promote_repository }}
     steps:
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Promote :v012 (and :latest only when explicitly requested)
+      - uses: actions/checkout@v4
+      - name: Manifest-preserving promotion and exact readback
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
+          case "$VERSION" in
+            v0.12.18)
+              EXPECTED_MAP_SHA256=80fe23246f94557279b4da2792119489f7c60f8e452b83de2c1c33ef48ebd03f
+              ;;
+            v0.12.23)
+              EXPECTED_MAP_SHA256=c5a310465b9005573c9fef79534e34a7822447d6c7004f24271ed59df61fe2a6
+              ;;
+            v0.12.28)
+              EXPECTED_MAP_SHA256=4f35cf6205a9f01b3acd22a27579dbab48411ad05bb5c80c1b9ec1f919d75431
+              ;;
+            v0.12.27)
+              EXPECTED_MAP_SHA256=5dfc6f51c2b2cde6ba0f152b06de0ae35624c09e8ad159b3555cd92c6674178d
+              ;;
+            *)
+              echo "::error ::$VERSION has no reviewed stable-promotion map identity"
+              exit 1
+              ;;
+          esac
           move() {
-            local dst="$1:$2" src="$1:$VERSION"
-            case "$dst" in
+            local image="$1" target="$2"
+            case "$image:$target" in
               vexaai/vexa-bot:dev|vexaai/vexa-bot:latest|*:dev)
-                echo "::error ::constitutional guard: refusing to move $dst (vexa-bot:{dev,latest} belong to the 0.10 line; :dev is never moved by release CI)"
+                echo "::error ::constitutional guard: refusing to move $image:$target (vexa-bot:{dev,latest} belong to the 0.10 line; :dev is never moved by release CI)"
                 exit 1;;
             esac
-            echo "→ $dst ⇐ $src"
-            docker buildx imagetools create -t "$dst" "$src"
+            local unchanged=()
+            if [ "$target" = "v012" ] && [ "$PROMOTE_LATEST" != "true" ]; then
+              unchanged=(--assert-unchanged-tag latest)
+            fi
+            node scripts/registry-manifest-alias.mjs \
+              --candidate-map "releases/$VERSION/candidate-images.json" \
+              --expected-map-sha256 "$EXPECTED_MAP_SHA256" \
+              --repository "$image" \
+              --source-tag "$VERSION" \
+              --target-tag "$target" \
+              "${unchanged[@]}"
           }
-          for img in $ALL_IMAGES; do
+
+          if [ "$PROMOTE_REPOSITORY" = "all" ]; then
+            images="$ALL_IMAGES"
+          elif grep -Fxq "$PROMOTE_REPOSITORY" < <(tr ' ' '\n' <<<"$ALL_IMAGES"); then
+            images="$PROMOTE_REPOSITORY"
+          else
+            echo "::error ::$PROMOTE_REPOSITORY is not a frozen release repository"
+            exit 1
+          fi
+
+          for img in $images; do
             move "$img" v012
           done
           if [ "$PROMOTE_LATEST" = "true" ]; then
-            for img in $ALL_IMAGES; do
+            for img in $images; do
               if [ "$img" = "vexaai/vexa-bot" ]; then
                 echo "· skipping vexaai/vexa-bot:latest (constitutional guard — 0.10 line)"
                 continue
@@ -773,3 +1110,11 @@ jobs:
           else
             echo "· :latest untouched (promote_latest not requested)"
           fi
+
+          node scripts/registry-candidate-validate.mjs \
+            --candidate-map "releases/$VERSION/candidate-images.json" \
+            --tag v012 \
+            --expected-map-stable-tag "$VERSION" \
+            --expected-map-sha256 "$EXPECTED_MAP_SHA256" \
+            --expected-top-descriptors 10 \
+            --expected-platform-identities 19

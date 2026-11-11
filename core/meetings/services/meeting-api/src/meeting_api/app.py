@@ -28,17 +28,28 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import bot_spawn as _bot_spawn
+from . import events as _flows_events
 from . import recordings as _recordings
 from .collector.app import build_router as _build_collector_router
 from .collector.ports import RedisBus, TranscriptStore
 from .lifecycle.machine import LifecycleSink, MeetingStore
 from .obs import TraceMiddleware
+
+#: In-process capture of the last N emitted webhook envelopes — an eval/introspection seam, never a
+#: durable store (the DB meeting row is the durable record; the WebhookSink is the delivery path).
+#: BOUNDED because it lives on the production app and every bot lifecycle callback appends one
+#: envelope that embeds the meeting's ``data`` projection; an unbounded list grew RSS monotonically
+#: under production callback traffic while idle staging (no callbacks) stayed flat (#803). A ring
+#: buffer keeps the recent-envelope semantics every reader relies on (``[-1]``, ``len``, iteration)
+#: while capping retention.
+_ENVELOPE_LOG_CAP = 256
 
 
 def _xpending_total(summary) -> "Optional[int]":
@@ -62,7 +73,12 @@ async def _pipeline_health(app) -> "tuple[dict, bool]":
     stamping, so its tick_age_s climbs past PIPELINE_TICK_STALE_S even while the process and the
     live-WS path look healthy — the 2026-04-26 silent hang. A crashed replica's delivered-but-un-acked
     batch is NOT lag (it was delivered) and NOT a stale heartbeat on the survivor, so #636 surfaces it
-    as ``pending_depth``. Returns ``({loops, consumer_lag, pending_depth}, degraded)``.
+    as ``pending_depth``. Returns ``({loops, redis_reachable, consumer_lag, pending_depth}, degraded)``.
+
+    #809 — Redis is a CACHE/QUEUE dependency, not the process's spine: an unreachable Redis is
+    reported HONESTLY as ``redis_reachable: false`` but NEVER flips ``degraded`` (so it cannot 503 the
+    shared probe). DB-backed reads keep serving through a Redis outage, so readiness stays true — a
+    cache blip no longer becomes a total core outage (the 2026-07-19 boot-block/CrashLoop).
 
     The probe MUST NOT itself hang (that would defeat the point): the XINFO/XPENDING calls are each
     bounded by a 2s wait_for and any failure degrades that field to ``"unavailable"`` — never blocks."""
@@ -76,8 +92,27 @@ async def _pipeline_health(app) -> "tuple[dict, bool]":
 
     lag = None
     pending_depth = None
+    redis_reachable = None
     redis = getattr(st, "pipeline_redis", None)
     if redis is not None:
+        # #809: a bounded reachability PING FIRST — the honest per-component signal the 2026-07-19
+        # incident lacked (/health read "ok" through a 40-minute Redis outage). A dead Redis fails
+        # here within 2s; we then SKIP the stream probes (they would only time out too) and report
+        # their fields "unavailable". This NEVER sets `degraded`: Redis is a cache/queue, so the
+        # DB-backed readiness paths stay green and the shared probe stays 200 (no CrashLoop recurrence).
+        # `ping` is resolved defensively: a client without it (a minimal probe stub) leaves
+        # reachability UNKNOWN (None) and the stream probes run exactly as before — the real
+        # ``redis.asyncio`` client always has ``ping``, so production always gets the honest signal.
+        ping = getattr(redis, "ping", None)
+        if ping is not None:
+            try:
+                await asyncio.wait_for(ping(), timeout=2.0)
+                redis_reachable = True
+            except Exception:
+                redis_reachable = False
+    # Run the stream probes unless we KNOW Redis is down (reachable is False). Unknown (None, no
+    # ping) or True → probe, preserving the pre-#809 lag/pending behaviour.
+    if redis is not None and redis_reachable is not False:
         try:
             groups = await asyncio.wait_for(redis.xinfo_groups(st.pipeline_stream), timeout=2.0)
             for g in groups or []:
@@ -99,11 +134,20 @@ async def _pipeline_health(app) -> "tuple[dict, bool]":
                 pending_depth = "unavailable"
         except Exception:
             pending_depth = "unavailable"  # never block the probe on a pending read
+    elif redis is not None and redis_reachable is False:
+        # #809: Redis unreachable → the stream signals are unavailable, but readiness is NOT degraded.
+        lag = "unavailable"
+        pending_depth = "unavailable"
     if isinstance(lag, int) and lag > lag_alarm:
         degraded = True
     if isinstance(pending_depth, int) and pending_depth > pending_alarm:
         degraded = True
-    return {"loops": loops, "consumer_lag": lag, "pending_depth": pending_depth}, degraded
+    return {
+        "loops": loops,
+        "redis_reachable": redis_reachable,
+        "consumer_lag": lag,
+        "pending_depth": pending_depth,
+    }, degraded
 
 
 def create_app(
@@ -114,6 +158,7 @@ def create_app(
     # bot_spawn ports
     meeting_repo: Optional["_bot_spawn.MeetingRepo"] = None,
     runtime: Optional["_bot_spawn.RuntimeClient"] = None,
+    service_authority: Optional["object"] = None,
     # recordings ports
     recording_repo: Optional["_recordings.RecordingRepo"] = None,
     storage: Optional["_recordings.Storage"] = None,
@@ -124,6 +169,12 @@ def create_app(
     command_publisher: Optional["object"] = None,
     # per-user webhook delivery sink (WebhookSink) — delivers meeting.status_change on each FSM advance
     webhook_sink: Optional["object"] = None,
+    # operator-owned terminal callback — boot-frozen destination, never user/meeting input
+    system_webhook_sink: Optional["object"] = None,
+    # per-user delivery ledger (#841) — the queryable record GET /webhooks/deliveries reads. The
+    # lifecycle callback records each delivery outcome here so the dashboard's Delivery History
+    # reflects real deliveries, not just the Test button. None → in-memory fake (app-factory/tests).
+    delivery_ledger: Optional["object"] = None,
     # completion finalizer — awaited with the NUMERIC meeting id when the FSM lands on a TERMINAL
     # status (completed/failed). Production wires collector/db_writer.finalize_meeting: flush the
     # meeting's remaining redis segments to Postgres + persist the processed doc into meeting.data,
@@ -172,18 +223,46 @@ def create_app(
         meeting_repo = _bot_spawn_fakes().InMemoryMeetingRepo()
     if runtime is None:
         runtime = _bot_spawn_fakes().FakeRuntimeClient()
+    if service_authority is None:
+        from .service_authority import AllowAllServiceAuthority
+
+        service_authority = AllowAllServiceAuthority()
+    app.state.service_authority = service_authority
 
     # --- lifecycle: bot lifecycle callbacks + FSM (lifecycle.v1), PERSISTED to the meeting row ---
     sink = LifecycleSink(store=meeting_store if meeting_store is not None else MeetingStore())
     app.state.lifecycle_sink = sink
     app.state.lifecycle_store = sink.store
     app.state.webhook_sink = webhook_sink
+    # #841: the per-user delivery ledger the read endpoint serves. Default to the in-memory fake so
+    # the app-factory / conformance path stands up without redis (same pattern as the other ports).
+    if delivery_ledger is None:
+        from .webhooks import InMemoryDeliveryLedger
+
+        delivery_ledger = InMemoryDeliveryLedger()
+    app.state.delivery_ledger = delivery_ledger
     # The lifecycle callback publishes each persisted FSM advance to bm:meeting:{id}:status so the
     # gateway /ws (which SUBSCRIBEs that channel) forwards a ws.v1 BotStatus frame to the dashboard.
-    _mount_lifecycle(app, sink, meeting_repo, webhook_sink, redis, transcript_finalizer)
+    _mount_lifecycle(
+        app,
+        sink,
+        meeting_repo,
+        webhook_sink,
+        system_webhook_sink,
+        redis,
+        transcript_finalizer,
+        delivery_ledger,
+    )
 
     # --- bot_spawn: POST /bots (invocation.v1 + runtime.v1) ---
-    app.include_router(_bot_spawn.build_router(meeting_repo, runtime))
+    # No `fetch_bot_context` here: `request_bot` resolves this person's default bot name out of the
+    # spawn context it already fetches for the transcription backend and the capture-signal
+    # decision. Injecting a second fetcher made POST /bots ask identity for the same body twice.
+    app.include_router(_bot_spawn.build_router(
+        meeting_repo,
+        runtime,
+        service_authority,
+    ))
 
     # --- user-stop: DELETE /bots/{platform}/{native_meeting_id} (lifecycle/stop.py over redis) ---
     from .lifecycle.stop_router import InMemoryCommandPublisher, build_stop_router
@@ -199,21 +278,61 @@ def create_app(
     from .lifecycle.extension import build_extension_router
     app.include_router(build_extension_router(meeting_repo, command_publisher, enabled=pathwarden_extension))
 
+    # Resolve the shared recording storage before mounting the collector: completed-meeting erasure
+    # uses this same port to delete objects before its transcript/JSONB finalization.
+    if storage is None:
+        storage = _recordings_fakes().InMemoryStorage()
+
+    async def _delete_recording_objects(recording: dict) -> list[str]:
+        from .recordings.deletion import delete_recording_objects
+
+        return await delete_recording_objects(storage, recording)
+
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---
     if transcript_store is None:
         transcript_store = _collector_fakes().InMemoryTranscriptStore()
     app.include_router(_build_collector_router(transcript_store, redis,
                                             calendar_sync_now=calendar_sync_now,
-                                            calendar_sync_status=calendar_sync_status))
+                                            calendar_sync_status=calendar_sync_status,
+                                            artifact_object_deleter=_delete_recording_objects))
 
     # --- recordings: chunk upload + finalize → meeting.data JSONB (recording.v1) ---
     if recording_repo is None:
         recording_repo = _recordings_fakes().InMemoryRecordingRepo()
-    if storage is None:
-        storage = _recordings_fakes().InMemoryStorage()
     app.include_router(_recordings.build_router(recording_repo, storage, token_secret=token_secret))
 
+    # --- webhooks: GET /webhooks/deliveries — the per-user delivery history the dashboard reads (#841) ---
+    app.include_router(_build_webhooks_router(delivery_ledger))
+
     return app
+
+
+# ── webhooks read surface (#841): the queryable delivery ledger the dashboard's history reads ────
+
+
+def _build_webhooks_router(delivery_ledger: "object") -> "object":
+    """``GET /webhooks/deliveries`` — the per-user webhook delivery history (#841).
+
+    Owner-scoped via ``X-User-Id`` (the gateway injects it from the resolved key; the client never
+    sets it). Returns ``{deliveries: [...]}`` newest-first — each row is the #817 outcome taxonomy
+    (host only, never a URL or secret; P14). This is the user-facing completion of #815→#817:
+    the dispatcher records every outcome here, so real deliveries appear in Delivery History, not
+    just the dashboard's own Test button.
+    """
+    from fastapi import APIRouter, Header, Query
+
+    router = APIRouter()
+
+    @router.get("/webhooks/deliveries")
+    async def list_deliveries(
+        x_user_id: Optional[str] = Header(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ):
+        user_id = x_user_id
+        deliveries = await delivery_ledger.list(user_id, limit=limit) if user_id else []
+        return {"deliveries": deliveries}
+
+    return router
 
 
 # ── lifecycle mount (the receiver's callback route, on the shared app) ───────────────────────────
@@ -235,8 +354,10 @@ def _mount_lifecycle(
     sink: LifecycleSink,
     meeting_repo: "_bot_spawn.MeetingRepo",
     webhook_sink: "object" = None,
+    system_webhook_sink: "object" = None,
     redis: "object" = None,
     transcript_finalizer: "object" = None,
+    delivery_ledger: "object" = None,
 ) -> None:
     """Register the lifecycle.v1 callback route on the unified app (the lifecycle receiver's
     ``/bots/internal/callback/lifecycle`` handler, sharing the app's TraceMiddleware).
@@ -256,6 +377,7 @@ def _mount_lifecycle(
     import jsonschema
 
     from .lifecycle.machine import IllegalTransition, TransitionSource
+    from .lifecycle.provenance import build_service_provenance
     from .lifecycle.receiver import conforms
     from .lifecycle.webhook import build_status_change_envelope, build_typed_envelope
     from .obs import log_event
@@ -278,6 +400,7 @@ def _mount_lifecycle(
             "status": row.get("status"),
             "completion_reason": data.get("completion_reason"),
             "failure_stage": data.get("failure_stage"),
+            "service_provenance": data.get("service_provenance"),
             "start_time": _iso(row.get("start_time")),
             "end_time": _iso(row.get("end_time")),
             "data": clean_meeting_data(data),
@@ -285,8 +408,8 @@ def _mount_lifecycle(
             "updated_at": _iso(row.get("updated_at")),
         }
 
-    app.state.status_change_webhooks = []
-    app.state.typed_webhooks = []
+    app.state.status_change_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
+    app.state.typed_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
 
     async def _apply_lifecycle_event(
         body: dict,
@@ -328,31 +451,79 @@ def _mount_lifecycle(
         connection_id = body.get("connection_id")
         if connection_id:
             existing = sink.store.get(connection_id)
-            if existing is None or existing.status is None:
+            # A TERMINAL event also re-reads the row, even for a record this process already
+            # advanced. The user-stop flag is written to the DB by the stop path and NEVER through
+            # this FSM, so an in-process record that has seen `joining` has no way to know a DELETE
+            # landed — and it is exactly at the terminal edge that the difference is written down
+            # (F3, stage rev 193 row 26313: terminal recorded `join_failure` with
+            # `stop_requested=true` on the row). One extra read per meeting, at its last event.
+            terminal_event = body.get("status") in ("completed", "failed")
+            if (
+                existing is None
+                or existing.status is None
+                or (terminal_event and not existing.stop_requested)
+            ):
                 try:
-                    persisted = await meeting_repo.get_status_by_session(session_uid=connection_id)
+                    persisted = await meeting_repo.get_lifecycle_state_by_session(
+                        session_uid=connection_id
+                    )
                 except Exception as e:  # noqa: BLE001 — rehydration is best-effort
                     persisted = None
                     log_event("lifecycle_rehydrate_failed", audience="system", level="warning",
                               span="lifecycle.callback", fields={"error": str(e)})
                 if persisted:
-                    sink.store.rehydrate(connection_id, persisted)
+                    sink.store.rehydrate(
+                        connection_id,
+                        persisted.get("status"),
+                        persisted.get("data"),
+                    )
+        change = None
         try:
             change = sink.apply_change(
                 body,
                 transition_source=transition_source,
                 force_terminal_on_destroy=force_terminal_on_destroy,
             )
-        except IllegalTransition as e:
-            return (
-                409,
-                {
-                    "status": "error", "detail": str(e),
-                    "connection_id": e.connection_id,
-                    "from": e.frm.value if e.frm is not None else None,
-                    "to": e.to.value,
-                },
-            )
+        except IllegalTransition as first_error:
+            # Multiple API replicas each hold an independent, non-durable FSM. A replica that saw
+            # `joining` can receive `completed` after another replica persisted `active`/`stopping`.
+            # Refresh only after the local edge is illegal: this lets durable state repair a stale
+            # replica without letting a lagging DB read regress a live in-process record.
+            persisted = None
+            if connection_id:
+                try:
+                    persisted = await meeting_repo.get_lifecycle_state_by_session(
+                        session_uid=connection_id
+                    )
+                except Exception as refresh_error:  # noqa: BLE001 — preserve truthful 409 below
+                    log_event("lifecycle_refresh_failed", audience="system", level="warning",
+                              span="lifecycle.callback", fields={"error": str(refresh_error)})
+            if persisted:
+                sink.store.rehydrate(
+                    connection_id,
+                    persisted.get("status"),
+                    persisted.get("data"),
+                    replace_stale=True,
+                )
+                try:
+                    change = sink.apply_change(
+                        body,
+                        transition_source=transition_source,
+                        force_terminal_on_destroy=force_terminal_on_destroy,
+                    )
+                except IllegalTransition as refreshed_error:
+                    first_error = refreshed_error
+            if change is None:
+                e = first_error
+                return (
+                    409,
+                    {
+                        "status": "error", "detail": str(e),
+                        "connection_id": e.connection_id,
+                        "from": e.frm.value if e.frm is not None else None,
+                        "to": e.to.value,
+                    },
+                )
         rec = change.record
         # Build + record the status_change envelope only on a REAL advance — an idempotent replay
         # (change.no_op, e.g. the bot's 3x terminal retry) must NOT double-count it. The persist, the
@@ -389,20 +560,85 @@ def _mount_lifecycle(
         # This guarantees a completed meeting's transcript is durable even if the periodic
         # db-writer never gets another tick (crash/restart right after completion). Best-effort:
         # the periodic loop retries anything this misses; never fail the bot's callback.
-        if (
-            transcript_finalizer is not None
-            and not change.no_op
+        terminal_advanced = (
+            not change.no_op
             and rec.status is not None
             and rec.status.value in ("completed", "failed")
             and isinstance(meeting_row, dict)
             and meeting_row.get("id") is not None
+        )
+        if (
+            transcript_finalizer is not None
+            and terminal_advanced
         ):
+            terminal_meeting_id = meeting_row["id"]
             try:
-                await transcript_finalizer(meeting_row["id"])
+                finalized_segments = await transcript_finalizer(terminal_meeting_id)
+                if isinstance(finalized_segments, int) and finalized_segments >= 0:
+                    rec_data = rec.data
+                    rec_data["segments_captured"] = finalized_segments
+                    updated_row = await meeting_repo.update_meeting_status(
+                        session_uid=rec.connection_id,
+                        status=rec.status.value,
+                        completion_reason=(
+                            rec.completion_reason.value if rec.completion_reason else None
+                        ),
+                        failure_stage=rec.failure_stage.value if rec.failure_stage else None,
+                        data=rec_data,
+                    )
+                    if isinstance(updated_row, dict):
+                        meeting_row = updated_row
             except Exception as e:  # noqa: BLE001 — the db-writer loop is the retry path
+                rec_data = rec.data
+                rec_data["transcript_finalize_failed"] = True
+                try:
+                    updated_row = await meeting_repo.update_meeting_status(
+                        session_uid=rec.connection_id,
+                        status=rec.status.value,
+                        completion_reason=(
+                            rec.completion_reason.value if rec.completion_reason else None
+                        ),
+                        failure_stage=rec.failure_stage.value if rec.failure_stage else None,
+                        data=rec_data,
+                    )
+                    if isinstance(updated_row, dict):
+                        meeting_row = updated_row
+                except Exception:  # noqa: BLE001 — original finalization failure is the signal
+                    pass
                 log_event("transcript_finalize_failed", audience="system", level="warning",
                           span="lifecycle.callback",
-                          fields={"meeting_id": meeting_row.get("id"), "error": str(e)})
+                          fields={"meeting_id": terminal_meeting_id, "error": str(e)})
+        if terminal_advanced and isinstance(meeting_row, dict):
+            data = dict(meeting_row.get("data") or {})
+            provenance = build_service_provenance({**meeting_row, "data": data})
+            if provenance is not None:
+                data["service_provenance"] = provenance
+                # The event projection can truthfully carry the producer facts even if this
+                # best-effort persistence attempt fails, matching the callback's established
+                # availability contract. The next reconciliation pass owns that exception.
+                projection_row = {**meeting_row, "data": data}
+                try:
+                    updated_row = await meeting_repo.update_meeting_status(
+                        session_uid=rec.connection_id,
+                        status=rec.status.value,
+                        completion_reason=(
+                            rec.completion_reason.value if rec.completion_reason else None
+                        ),
+                        failure_stage=rec.failure_stage.value if rec.failure_stage else None,
+                        data=data,
+                    )
+                    meeting_row = (
+                        updated_row if isinstance(updated_row, dict) else projection_row
+                    )
+                except Exception as e:  # noqa: BLE001 — callback availability is pre-existing
+                    meeting_row = projection_row
+                    log_event(
+                        "service_provenance_persist_failed",
+                        audience="system",
+                        level="warning",
+                        span="lifecycle.callback",
+                        fields={"meeting_id": meeting_row.get("id"), "error": str(e)},
+                    )
         # Build the TYPED event the transition maps to (meeting.started on active,
         # meeting.completed with the post-meeting envelope on completion, bot.failed on terminal
         # failure) — additive alongside meeting.status_change, never instead of it. Built AFTER the
@@ -417,6 +653,107 @@ def _mount_lifecycle(
             )
             if typed_envelope is not None:
                 app.state.typed_webhooks.append(typed_envelope)
+        # THE MEETINGS→FLOWS PUBLISH EDGE (F168/F181, ADR-0037 / PRD 46 decision 42.2). An ad hoc
+        # bot — started via the MCP `request_meeting_bot`, never through a calendar invite — has no
+        # `invite_intake` reaction running for it, and that flow is the only thing that has ever
+        # told flows a meeting started or finished (`emit_started` / `emit_completed`, PRD decision
+        # 42.2). meeting-api's only outbound door used to be the operator webhook just above, which
+        # flows does not read. So this fires on exactly the two typed transitions that door already
+        # watches — one new domain telling flows a fact only meeting-api can know, alongside (never
+        # instead of) the webhook.
+        #
+        # THE SOURCE_EVENT_ID DELIBERATELY MATCHES flows' OWN SCHEME (`live-<id>` / `done-<id>`,
+        # `lifecycle/webhook.py` / `flows_defs/production.py`), not a meeting-api-flavoured one.
+        # Admission dedups on `(source_event_id, flow)` (flows/admission.py), so for a
+        # calendar-intake meeting — where `invite_intake` ALSO emits the same two facts from
+        # inside itself — whichever producer's HTTP call lands first admits and the other is a
+        # free no-op, rather than a second reaction (a second `post_meeting` run is a duplicate
+        # email, not a no-op). A different id here would double-fire every calendar meeting.
+        # See `events.py` for the ref-richness trade this same choice carries: meeting-api holds
+        # no invite (no `participants`/`group`), so on `meeting.completed` for a calendar meeting
+        # meeting-api's own publish typically WINS the race (it fires the instant the DB row goes
+        # `completed`; flows' own `emit_completed` only fires after its next poll tick), and
+        # `process_meeting`'s room-read degrades to empty rather than to invite order — see the
+        # filed issue for this deployment's disposition of that trade-off.
+        if typed_envelope is not None and isinstance(meeting_row, dict):
+            _meeting_block = (typed_envelope.get("data") or {}).get("meeting")
+            if isinstance(_meeting_block, dict):
+                _et = typed_envelope.get("event_type")
+                _uid = _meeting_block.get("user_id")
+                if _uid is not None and _et == "meeting.started":
+                    try:
+                        await _flows_events.publish_meeting_started(
+                            _meeting_block.get("id"),
+                            _meeting_block.get("native_meeting_id"),
+                            _meeting_block.get("platform"),
+                            _uid,
+                        )
+                    except Exception:  # noqa: BLE001 — a publish edge is not a dependency
+                        pass
+                elif _uid is not None and _et == "meeting.completed":
+                    try:
+                        await _flows_events.publish_meeting_completed(
+                            _meeting_block.get("id"),
+                            _meeting_block.get("native_meeting_id"),
+                            _meeting_block.get("platform"),
+                            _uid,
+                            _meeting_block.get("completion_reason"),
+                        )
+                    except Exception:  # noqa: BLE001 — a publish edge is not a dependency
+                        pass
+        # The operator callback is a separate trust boundary from a customer's
+        # webhook. It receives terminal service facts only, through a destination
+        # frozen by deployment config. A transient failure is retained by the
+        # sink's dedicated retry queue; it never falls back to a user URL.
+        if (
+            system_webhook_sink is not None
+            and typed_envelope is not None
+            and typed_envelope.get("event_type") in {
+                "meeting.completed",
+                "bot.failed",
+            }
+        ):
+            try:
+                result = await system_webhook_sink.deliver(
+                    typed_envelope,
+                    label=f"meeting:{meeting_row.get('id')}"
+                    if isinstance(meeting_row, dict)
+                    else f"session:{rec.connection_id}",
+                )
+                if result is not None:
+                    log_event(
+                        "system_webhook_delivery",
+                        audience="system",
+                        level=(
+                            "info"
+                            if result.status == "delivered"
+                            else "warning"
+                        ),
+                        span="lifecycle.callback",
+                        meeting_id=(
+                            meeting_row.get("id")
+                            if isinstance(meeting_row, dict)
+                            else None
+                        ),
+                        fields={
+                            "outcome": result.status,
+                            "event_type": typed_envelope.get("event_type"),
+                            "status_code": result.status_code,
+                        },
+                    )
+            except Exception as e:  # noqa: BLE001 — terminal fact stays in meeting storage
+                log_event(
+                    "system_webhook_delivery_failed",
+                    audience="system",
+                    level="warning",
+                    span="lifecycle.callback",
+                    meeting_id=(
+                        meeting_row.get("id")
+                        if isinstance(meeting_row, dict)
+                        else None
+                    ),
+                    fields={"error_type": type(e).__name__},
+                )
         # Deliver the sealed webhook.v1 envelopes (meeting.status_change + the typed event, if any)
         # to the user's configured endpoint (per-user config rides on meeting.data — set at spawn
         # from identity via the gateway; NO users-table read). The sink's per-user event filter
@@ -456,6 +793,31 @@ def _mount_lifecycle(
                                 "error": result.error,
                             },
                         )
+                        # #841: ALSO record the outcome in the per-user delivery ledger — the
+                        # queryable surface GET /webhooks/deliveries serves. Logs (above) rotate and
+                        # are operator-facing; the ledger is the user's Delivery History. Host only,
+                        # never the URL/secret (P14). Best-effort — a ledger hiccup never fails the
+                        # callback, and a suppressed event is still worth recording (the user asked
+                        # "why didn't my webhook fire?" — "suppressed: unsubscribed" is the answer).
+                        if delivery_ledger is not None:
+                            from .webhooks import build_delivery_record
+
+                            try:
+                                await delivery_ledger.record(
+                                    meeting_row.get("user_id"),
+                                    build_delivery_record(
+                                        event_type=env.get("event_type"),
+                                        event_id=env.get("event_id"),
+                                        target_host=_webhook_target_host(url),
+                                        outcome=result.status,
+                                        status_code=result.status_code,
+                                        meeting_id=meeting_row.get("id"),
+                                    ),
+                                )
+                            except Exception as le:  # noqa: BLE001 — ledger is best-effort
+                                log_event("webhook_ledger_failed", audience="system",
+                                          level="warning", span="lifecycle.callback",
+                                          fields={"error": str(le)})
                     except Exception as e:  # noqa: BLE001 — delivery is best-effort
                         log_event("webhook_deliver_failed", audience="system", level="warning",
                                   span="lifecycle.callback", fields={"error": str(e)})
@@ -636,6 +998,7 @@ def _mount_lifecycle(
 
             await synthesize_terminal_for_dead_workload(
                 meeting_repo, workload_id, state, _drive_terminal,
+                event_at=body.get("at"),
                 log=_logging.getLogger("meeting_api.runtime.callback"),
             )
         except Exception as e:  # noqa: BLE001 — the runtime ACK must never fail on the terminal backstop

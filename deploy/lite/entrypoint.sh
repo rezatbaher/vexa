@@ -35,12 +35,26 @@ export DB_PASSWORD="${DB_PASSWORD:-postgres}"
 # ─── Defaults for every var supervisord interpolates (empty is fine; must be SET) ─────────────────
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 export DISPLAY="${DISPLAY:-:99}"
-export ADMIN_API_TOKEN="${ADMIN_API_TOKEN:-${ADMIN_TOKEN:-changeme}}"
-export INTERNAL_API_SECRET="${INTERNAL_API_SECRET:-lite-internal-secret}"
-export DEFAULT_BOT_NAME="${DEFAULT_BOT_NAME:-}"
+# The admin tier, on the same terms as the internal tier below and for a LARGER blast radius:
+# this token mints an API key for ANY user and HS256-signs every per-spawn MeetingToken. It
+# defaulted to the published literal `changeme`, so every lite stack nobody configured shared one
+# admin secret that is in this repository (A19). lite is ONE container, so the fallback can be
+# MINTED per boot: admin-api, meeting-api, the dashboard, the terminal and provision-key all read
+# it from this same environment. Set ADMIN_API_TOKEN (or ADMIN_TOKEN) explicitly when something
+# outside the container has to present it.
+export ADMIN_API_TOKEN="${ADMIN_API_TOKEN:-${ADMIN_TOKEN:-$(python3 -c "import secrets; print(secrets.token_hex(32))")}}"
+# The internal tier. lite is ONE container, so every service that shares this secret shares this
+# process's environment — which means the fallback can be MINTED per boot instead of shipped as
+# a literal. `lite-internal-secret` was published in this repository and was the exact value
+# agent-api's _internal_caller compared against, so anyone who could reach the port was the
+# internal tier (F95). A random per-boot value keeps the one-command quickstart working and is
+# nobody's to guess; set INTERNAL_API_SECRET explicitly when something outside talks in.
+export INTERNAL_API_SECRET="${INTERNAL_API_SECRET:-$(python3 -c "import secrets; print(secrets.token_hex(32))")}"
+export DEFAULT_BOT_NAME="${DEFAULT_BOT_NAME:-Vexa}"
 
 # Optional Google Meet speaker-stream tuning. Empty values preserve bot defaults; the runtime
 # profile forwards configured values to every spawned bot process.
+export BOT_ALONE_SILENCE_WINDOW_MS="${BOT_ALONE_SILENCE_WINDOW_MS:-}"
 export BOT_SPEAKER_MIN_AUDIO_SEC="${BOT_SPEAKER_MIN_AUDIO_SEC:-}"
 export BOT_SPEAKER_SUBMIT_INTERVAL_SEC="${BOT_SPEAKER_SUBMIT_INTERVAL_SEC:-}"
 export BOT_SPEAKER_CONFIRM_THRESHOLD="${BOT_SPEAKER_CONFIRM_THRESHOLD:-}"
@@ -51,6 +65,15 @@ export TRANSCRIPTION_SERVICE_URL="${TRANSCRIPTION_SERVICE_URL:-}"
 export TRANSCRIPTION_SERVICE_TOKEN="${TRANSCRIPTION_SERVICE_TOKEN:-}"
 # STT model id for validating backends (Groq/vLLM); empty → whisper-1.
 export TRANSCRIPTION_MODEL="${TRANSCRIPTION_MODEL:-}"
+
+# Optional operator-owned service-authority.v1 boundary. The config stays credential-free; the
+# signing secret remains a separate inherited environment value and is never printed below.
+export VEXA_SERVICE_AUTHORITY_CONFIG="${VEXA_SERVICE_AUTHORITY_CONFIG:-}"
+export VEXA_SERVICE_AUTHORITY_SECRET="${VEXA_SERVICE_AUTHORITY_SECRET:-}"
+export VEXA_SYSTEM_WEBHOOK_URL="${VEXA_SYSTEM_WEBHOOK_URL:-}"
+export VEXA_SYSTEM_WEBHOOK_SECRET="${VEXA_SYSTEM_WEBHOOK_SECRET:-}"
+export VEXA_SYSTEM_WEBHOOK_ALLOW_PRIVATE_HTTP="${VEXA_SYSTEM_WEBHOOK_ALLOW_PRIVATE_HTTP:-false}"
+export VEXA_SYSTEM_WEBHOOK_TIMEOUT_S="${VEXA_SYSTEM_WEBHOOK_TIMEOUT_S:-10}"
 
 export MINIO_ENDPOINT="${MINIO_ENDPOINT:-}"
 export MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-}"
@@ -79,7 +102,8 @@ export VEXA_MEETING_MODEL="${VEXA_MEETING_MODEL:-}"
 # HOST_CLAUDE_CREDENTIALS (config.v1 `model_inference`): path of a claude credentials JSON as seen
 # INSIDE this lite container (mount it in, e.g. -v ~/.claude/.credentials.json:/claude-creds.json:ro
 # and set HOST_CLAUDE_CREDENTIALS=/claude-creds.json). Lite's runtime uses the process backend, so
-# the worker reads the file directly; the runtime's config.v1 file probe verifies it on /health.
+# the worker reads the file directly; the runtime's config.v1 file probe
+# verifies it on /health.
 # Alternative: leave empty and set ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN instead.
 export HOST_CLAUDE_CREDENTIALS="${HOST_CLAUDE_CREDENTIALS:-}"
 export CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"

@@ -15,11 +15,77 @@ import json
 import os
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from .ports import RecordingRepo, Storage
-from .service import SessionNotFound, _verify_meeting_token, finalize_master, upload_chunk
+from .deletion import MeetingNotTerminal, delete_owned_recording
+from .service import (
+    SIGNAL_MEDIA_TYPE,
+    InvalidSignalTape,
+    SessionNotFound,
+    _verify_meeting_token,
+    finalize_master,
+    upload_chunk,
+    upload_signal_tape,
+)
+
+
+#: Default page size for ``GET /recordings``. The route used to have none: it answered with every
+#: recording the account had ever made, full detail, oldest first — 201 rows and 1.6 MB for one
+#: dogfooding account, straight into a calling model's context through the MCP's `list_recordings`
+#: (fr_db203061a7a1d953). A default is what makes the first call cheap for a caller who did not
+#: know to ask; the cap is what keeps it cheap for one who asks for too much.
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 200
+
+#: Per-media-file keys the LIST row keeps. Everything else on a media file describes HOW the bytes
+#: were assembled — `chunk_seq`, `chunk_count`, `last_chunk_size_bytes`, `first_chunk_at`,
+#: `storage_path`, `storage_backend`, `is_final`, `finalized_at/by`, `metadata` — which is upload
+#: bookkeeping no list renders and no caller can act on. It stays whole on
+#: ``GET /recordings/{id}``, which is where a caller goes when they want one recording.
+LIST_MEDIA_FILE_KEYS = ("id", "type", "format", "duration_seconds", "file_size_bytes")
+
+#: Top-level keys the LIST row keeps. `playback_url` is the one a client actually follows, so it
+#: stays; `user_id`/`session_uid`/`source` identify the producer, not the recording, and the
+#: caller already knows they are themselves.
+LIST_RECORDING_KEYS = (
+    "id", "meeting_id", "status", "created_at", "completed_at", "playback_url",
+    "deletion_pending",
+)
+
+
+def _list_sort_key(rec: dict) -> tuple:
+    """NEWEST FIRST, deterministically.
+
+    There is no recordings table — recordings live inside ``meeting.data`` JSONB (see
+    ``recordings/jsonb.py``), so this cannot be an ``ORDER BY`` and the stored order is worse than
+    arbitrary: ``service.py`` appends the freshest recording to the TAIL of its meeting's list, so
+    the natural order is oldest-first. `created_at` is a UTC ISO-8601 string from ``_now_iso()``, so
+    lexicographic ordering IS chronological ordering; the id breaks ties so a page boundary does not
+    move between two calls.
+    """
+    return (str(rec.get("created_at") or ""), rec.get("id") or 0)
+
+
+def _project_list_recording(rec: dict) -> dict:
+    """One recording, shaped for a LIST row.
+
+    ``duration_seconds`` is lifted to the top level as the longest of the recording's media files —
+    a list wants "how long is this", and the answer otherwise only exists per media file. The audio
+    and video tracks of one recording are the same take, so the longest is the recording's length.
+    """
+    out = {k: rec[k] for k in LIST_RECORDING_KEYS if k in rec}
+    media = rec.get("media_files")
+    media = media if isinstance(media, list) else []
+    out["media_files"] = [
+        {k: m[k] for k in LIST_MEDIA_FILE_KEYS if k in m}
+        for m in media if isinstance(m, dict)
+    ]
+    durations = [m.get("duration_seconds") for m in media
+                 if isinstance(m, dict) and isinstance(m.get("duration_seconds"), (int, float))]
+    out["duration_seconds"] = max(durations) if durations else None
+    return out
 
 
 def _bearer_token(authorization: Optional[str]) -> str:
@@ -140,6 +206,33 @@ def build_router(
             raise HTTPException(status_code=422, detail="session_uid required (flat field or metadata)")
         media_type = media_type or meta.get("media_type") or "audio"
         media_format = media_format or meta.get("media_format") or meta.get("format") or "wav"
+        # O-TEL-1 — a captured-signal tape rides this same endpoint (one internal upload edge, one
+        # set of credentials, one network path already open from every bot) but takes a DIFFERENT
+        # server path: no JSONB fold, no chunking, no master. See service.upload_signal_tape.
+        if media_type == SIGNAL_MEDIA_TYPE:
+            part = str(meta.get("part") or "")
+            bearer = _bearer_token(authorization)
+            internal_secret = os.getenv("INTERNAL_API_SECRET")
+            token_meeting_id = None
+            if not (internal_secret and bearer == internal_secret):
+                try:
+                    claims = _verify_meeting_token(bearer, secret=token_secret)
+                except ValueError as e:
+                    raise HTTPException(status_code=401,
+                                        detail=f"Invalid recording upload token: {e}")
+                token_meeting_id = int(claims["meeting_id"])
+            try:
+                receipt = await upload_signal_tape(
+                    repo, storage,
+                    token_meeting_id=token_meeting_id,
+                    session_uid=session_uid, data=await file.read(),
+                    part=part, media_format=media_format,
+                )
+            except InvalidSignalTape as e:
+                raise HTTPException(status_code=422, detail=str(e))
+            except SessionNotFound as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            return JSONResponse(content=receipt)
         chunk_seq = chunk_seq if chunk_seq is not None else int(meta.get("chunk_seq", 0) or 0)
         is_final = is_final if is_final is not None else bool(meta.get("is_final", True))
         duration_seconds = duration_seconds if duration_seconds is not None else meta.get("duration_seconds")
@@ -179,10 +272,41 @@ def build_router(
     async def list_recordings(
         request: Request,
         x_user_id: Optional[str] = Header(default=None),
+        limit: int = Query(default=DEFAULT_LIST_LIMIT, ge=1, le=MAX_LIST_LIMIT),
+        offset: int = Query(default=0, ge=0),
+        meeting_id: Optional[int] = Query(default=None,
+                                          description="Only this meeting's recordings."),
     ):
+        """The caller's recordings, NEWEST FIRST, one page at a time, in the list shape.
+
+        Every one of those three was missing, and the gateway and the MCP tool had been forwarding
+        `limit`/`offset`/`meeting_id` into a route that declared none of them — FastAPI drops an
+        undeclared query parameter in silence, so `list_recordings(limit=3)` answered with all 201
+        recordings, 1.6 MB, oldest first, each carrying its per-chunk upload bookkeeping. A page
+        argument that is accepted and ignored is worse than one that is refused: the caller has no
+        way to tell the answer is not the one they asked for.
+
+        The read behind this is still the whole account (there is no recordings table — they live
+        in `meeting.data` JSONB), so the sort and the slice happen here. That is unchanged and out
+        of scope; what changes is that the RESPONSE is bounded, which is what reaches a caller.
+        """
         user_id = _resolve_user_id(x_user_id)
         recs = await repo.list_meeting_recordings(user_id)
-        return JSONResponse(content={"recordings": recs})
+        if meeting_id is not None:
+            recs = [r for r in recs if r.get("meeting_id") == meeting_id]
+        recs = sorted(recs, key=_list_sort_key, reverse=True)
+        total = len(recs)
+        page = recs[offset:offset + limit]
+        return JSONResponse(content={
+            "recordings": [_project_list_recording(r) for r in page],
+            # Named so a caller can page without guessing. `total` is honest here because the read
+            # already materialized every row; it is not a promise that a future paged read will
+            # still be able to count for free.
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < total,
+        })
 
     @router.get("/recordings/{recording_id}")
     async def get_recording(
@@ -198,6 +322,31 @@ def build_router(
         if rec is None:
             raise HTTPException(status_code=404, detail="Recording not found")
         return JSONResponse(content=rec)
+
+    @router.delete("/recordings/{recording_id}")
+    async def delete_recording(
+        recording_id: int,
+        x_user_id: Optional[str] = Header(default=None),
+    ):
+        """Delete one owned recording's primary-storage objects and JSONB metadata.
+
+        Unknown and unowned ids both return 404. Storage is deleted first so a backend failure
+        leaves the metadata/path available for a retry rather than orphaning an undiscoverable
+        object. Backup expiry remains a deployment retention concern, not a claim of this route.
+        """
+        user_id = _resolve_user_id(x_user_id)
+        try:
+            receipt = await delete_owned_recording(
+                repo, storage, user_id=user_id, recording_id=recording_id
+            )
+        except MeetingNotTerminal:
+            raise HTTPException(
+                status_code=409,
+                detail="Recording can only be deleted after the meeting lifecycle is terminal",
+            )
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        return JSONResponse(content=receipt)
 
     @router.get("/recordings/{recording_id}/master")
     async def get_recording_master(

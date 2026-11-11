@@ -14,7 +14,8 @@ This file is the actor contract: intake, claim, and how a session behaves in the
 ## Researching Vexa? Start here
 
 - **Found something** (bug, gap, docs lie)? **File a GitHub issue** — every report enters
-  `state: incoming` and a 3-day triage SLA. Findings are contributions.
+  `state: incoming` and waits for triage — three days is our target and we are not hitting it
+  (measured 2026-08-20: 26 waiting, median 13 days). Findings are contributions.
 - **Want to contribute?** The whole roadmap comes back in one public GraphQL call:
 
 ```bash
@@ -44,6 +45,21 @@ Selection rule: filter to your contributor's lane(s), then to the Human bar and 
 afford. `state: ready` is claimable now; `state: prepared` after the maintainer stamp; items
 with no issue number are declared direction — ask about them, don't claim them.
 
+## Driving Vexa from an agent session
+
+Vexa speaks **MCP**. Point your client at `/mcp` on the same host as the rest of the API — the
+same key, the same gateway — and you get Vexa's meeting tools and prompts with no integration code:
+
+```json
+{"mcpServers": {"Vexa": {"command": "npx", "args": ["-y", "mcp-remote",
+  "https://api.cloud.vexa.ai/mcp", "--header", "Authorization: Bearer ${VEXA_API_KEY}"]}}}
+```
+
+The key lives in `VEXA_API_KEY`. **Scopes decide which tools work**: a `bot`-only key dispatches
+bots and reads recordings but gets `403 Insufficient scope` on transcripts and meetings. The
+key's prefix is a hint, not the truth — call `GET /auth/me` for the scopes you actually hold.
+Full page: https://docs.vexa.ai/vexa-mcp
+
 ## Your issue is your PRD
 
 A prepared issue is a worked delivery spec — read it end to end before touching code:
@@ -71,6 +87,16 @@ A prepared issue is a worked delivery spec — read it end to end before touchin
    issue and the lease holds.
 
 ## How you work the checkout
+
+- **Contribution rights are a human decision; automate the mechanics.** Before the first commit,
+  read [`CONTRIBUTOR_RIGHTS.md`](CONTRIBUTOR_RIGHTS.md) and ask the human to choose independent,
+  employer/client-controlled, or unsure. Never choose or tick the PR declaration for them. After
+  the human explicitly chooses the independent or corporate path, inspect repository-local
+  `user.name` and `user.email`, surface any mismatch, and create every commit with
+  `git commit --signoff`. Never change global identity, insert another person's sign-off, enable
+  third-party remediation, or use a maintainer override. Diagnose missing/mismatched commits by
+  SHA. Before an amend/rebase/force-push, show the exact rewrite and obtain explicit approval;
+  prefer the DCO App's individual remediation commit on a shared branch.
 
 - **Discord is the working channel** — blockers, steering, quick questions live there while you
   work. One rule keeps the record honest: **anything decided lands back on the issue**, or it

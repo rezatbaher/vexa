@@ -59,6 +59,7 @@ from control_plane.workspace_attach import (
     swap_workspace,
     workspace_dir_for,
 )
+from control_plane.repo_ref import RepoRefError, assert_fetchable
 from control_plane.workspace_publish import PublishError, RepoExistsError, publish_workspace, published_remote_url
 from control_plane.workspace_git_sync import RemoteSyncError, pull_origin, push_origin, remote_status
 from control_plane.workspace_purpose import read_purpose, write_purpose
@@ -1569,6 +1570,12 @@ def create_app(
         Mounting is by-folder (``<root>/<subject>`` is what the next dispatch mounts), so the swapped
         tree takes effect on the subject's next turn — no dispatch change needed."""
         subject = subject_of(request)
+        # The repository is a caller-supplied instruction to THIS SERVER to go and fetch something, so
+        # the transport and the host are settled before anything reaches git (see control_plane/repo_ref).
+        try:
+            assert_fetchable(body.repo)
+        except RepoRefError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         _tok = (body.token or "").strip() or git_creds.read_github_token(wsr.root, subject)
         try:
             result = swap_workspace(wsr.root, subject, body.repo, body.ref or "main",
@@ -1622,6 +1629,10 @@ def create_app(
         """ADD a workspace to the active set WITHOUT parking the others (the additive counterpart of swap).
         Clones/restores the target if needed. Idempotent — an already-active workspace is a no-op."""
         subject = subject_of(request)
+        try:
+            assert_fetchable(body.repo)     # same gate as swap — see control_plane/repo_ref
+        except RepoRefError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         _tok = (body.token or "").strip() or git_creds.read_github_token(wsr.root, subject)
         try:
             result = activate_workspace(wsr.root, subject, body.repo, body.ref or "main",
@@ -1864,6 +1875,13 @@ def create_app(
                             "completed": seg.get("completed", True),
                             "id": seg.get("segment_id")}, cursor())
 
+            def retract_event(payload):
+                """A `retract` marker (the collector withdrew superseded/over-extended pending drafts) →
+                a `retract` SSE event so the terminal drops those segment ids from the live view."""
+                ids = payload.get("segment_ids") or []
+                if ids:
+                    yield ({"type": "retract", "segment_ids": ids}, cursor())
+
             def note_events(entry_fields):
                 """One proc-stream entry → the SAME `note` SSE event the out-stream used to carry
                 (meetingLive.ts upserts by note.id). The `view_end` marker flips completion instead."""
@@ -1887,6 +1905,9 @@ def create_app(
                         ending = True
                         ending_at = _time.monotonic()
                         last.pop(tkey, None)
+                        continue
+                    if payload.get("type") == "retract":
+                        yield from retract_event(payload)
                         continue
                     yield from seg_events(payload)
             if resume_o is None:   # fresh connect → seed the output (cards/agent-activity) replay
@@ -1933,6 +1954,9 @@ def create_app(
                                 ending_at = _time.monotonic()
                                 last.pop(tkey, None)     # session_end is the last transcript entry
                                 break
+                            if payload.get("type") == "retract":
+                                yield from retract_event(payload)
+                                continue
                             yield from seg_events(payload)
                         elif stream == pkey:
                             yield from note_events(fields)

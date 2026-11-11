@@ -14,7 +14,7 @@ COMPOSE  = docker compose -p $(PROJECT) -f docker-compose.yml
 REPO_ROOT := $(abspath ../..)
 BOT_IMAGE ?= vexa/vexa-bot:dev
 
-.PHONY: stack-test stack-test-bot stack-test-mock stack-test-v010 dashboard-harness provision-token up dev digest-audit down build ps logs bot _preflight _bot_check _creds_check _access
+.PHONY: stack-test stack-test-bot stack-test-mock stack-test-v010 dashboard-harness provision-token up dev digest-audit down destroy help build ps logs bot _preflight _bot_check _creds_check _access _storage_note migrate-storage
 
 ## provision-token — mint (idempotently) the self-host dashboard's API token (compose bring-up step 2).
 ## Needs ADMIN_TOKEN (the stack admin secret). Prints ONLY the token, so it pipes into the deploy:
@@ -39,7 +39,7 @@ stack-test-bot:
 	COMPOSE_BOT=1 ./bin/stack-test
 
 ## stack-test-stress — the control plane under CONCURRENT load (A:V2): N mock bots at once, no cap overspill.
-## Needs mock-bot:dev. Tune STRESS_N / STRESS_CAP. Pass COMPOSE_PROJECT + MINIO_HOST_PORT to isolate on a shared dev host.
+## Needs mock-bot:dev. Tune STRESS_N / STRESS_CAP. Pass COMPOSE_PROJECT + STORAGE_HOST_PORT to isolate on a shared dev host.
 stack-test-stress:
 	COMPOSE_STRESS=1 MOCK_BOT=1 BROWSER_IMAGE=$(BROWSER_IMAGE) ./bin/stack-test
 
@@ -64,12 +64,13 @@ stack-test-v010:
 
 ## up — the INSTALL entrypoint: PULLS the published, release-validated images (#569 — what users
 ## run must be the bytes the release machinery proved; a local build must never shadow a published
-## :v012 pointer). Seeds .env from .env.example if absent, pulls everything (services + the
+## :v012 pointer). Seeds .env from .env.example if absent and mints every secret the services refuse
+## to boot without (mint-dev-env.sh — never overwrites a value already set), pulls everything (services + the
 ## build-only agent-worker profile + the bot), brings the stack up WITHOUT building, then mints +
 ## prints an API key. Building from source is `make dev` (images tagged :dev, never v012 names).
 up:
 	@$(MAKE) --no-print-directory _preflight
-	@[ -f .env ] || { echo "→ no .env found; seeding from .env.example"; cp .env.example .env; }
+	@./mint-dev-env.sh .env
 	$(COMPOSE) pull
 	@_tag=$$(grep -E '^IMAGE_TAG=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]'); _tag=$${_tag:-v012}; \
 	 echo "→ pulling spawn-time images (agent-worker is a build-only compose profile pull skips)"; \
@@ -77,7 +78,8 @@ up:
 	 _bi=$$(grep -E '^BROWSER_IMAGE=' .env | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$$//; s/[[:space:]]+$$//'); \
 	 _bi=$$(printf '%s' "$$_bi" | sed "s/\$${IMAGE_TAG}/$$_tag/; s/\$$IMAGE_TAG/$$_tag/"); \
 	 case "$$_bi" in vexaai/*) docker pull "$$_bi";; esac
-	$(COMPOSE) up -d --no-build
+	$(COMPOSE) up -d --no-build || { $(MAKE) --no-print-directory _storage_note; exit 1; }
+	@$(MAKE) --no-print-directory _storage_note
 	@$(MAKE) --no-print-directory _bot_check
 	@$(MAKE) --no-print-directory _creds_check
 	@$(MAKE) --no-print-directory _access
@@ -87,12 +89,27 @@ up:
 ## interpolated refs (AGENT_WORKER_IMAGE etc.) follow IMAGE_TAG=dev coherently.
 dev:
 	@$(MAKE) --no-print-directory _preflight
-	@[ -f .env ] || { echo "→ no .env found; seeding from .env.example"; cp .env.example .env; }
-	IMAGE_TAG=dev $(COMPOSE) up -d --build
-	IMAGE_TAG=dev $(COMPOSE) build agent-worker  # profiles:[build-only] keeps it out of `up`
-	@$(MAKE) --no-print-directory _bot_check
-	@$(MAKE) --no-print-directory _creds_check
-	@$(MAKE) --no-print-directory _access
+	@./mint-dev-env.sh .env
+	IMAGE_TAG=dev $(COMPOSE) up -d --build || { $(MAKE) --no-print-directory _storage_note; exit 1; }
+	@$(MAKE) --no-print-directory _storage_note
+	@# Every remaining step must RUN and the target must exit non-zero naming EVERY gap. A failed
+	@# agent-worker build (a transient apt flake, #716) must NOT abort BEFORE the bot-image check —
+	@# that is exactly how a stack came up "healthy" but spawned dead bots with no signal (#718 C4).
+	@fail=""; \
+	 IMAGE_TAG=dev $(COMPOSE) build agent-worker || fail="$$fail agent-worker-build"; \
+	 $(MAKE) --no-print-directory _bot_check BOT_CHECK_STRICT=1 || fail="$$fail bot-image-missing"; \
+	 $(MAKE) --no-print-directory _creds_check; \
+	 $(MAKE) --no-print-directory _access; \
+	 if [ -n "$$fail" ]; then \
+	   echo ""; \
+	   echo "✗ make dev did not fully succeed —$$fail (see the messages above)."; \
+	   echo "  The stack is up, but spawned bots may fail to start until every item above is resolved."; \
+	   exit 1; \
+	 fi
+
+## _storage_note — surface the latest storage WARNING or STOP without failing if logs are unavailable.
+_storage_note:
+	@$(COMPOSE) logs --no-log-prefix --tail 20 storage-init 2>/dev/null | grep -E '^\[storage-init\] (WARNING|STOP):' | tail -n 1 || true
 
 ## digest-audit — the #569 negative control: every vexaai/*:$IMAGE_TAG image on this host must
 ## carry a RepoDigest (= came from the registry). A locally-built image has NO RepoDigest, so a
@@ -135,7 +152,13 @@ bot:
 	@echo "→ [1/2] join-env base: vexa/meet-join-env:dev"
 	docker build -f $(REPO_ROOT)/core/meetings/modules/join/Dockerfile.env -t vexa/meet-join-env:dev $(REPO_ROOT)/core/meetings/modules/join
 	@echo "→ [2/2] meeting bot: $(BOT_IMAGE)"
-	docker build -t $(BOT_IMAGE) -f $(REPO_ROOT)/core/meetings/services/bot/Dockerfile $(REPO_ROOT)
+	@# VEXA_IMAGE_VERSION stamps the build into every captured-signal tape this image produces
+	@# (telemetry.ts sessionHeader/sidecarHeader). A dirty tree still stamps its HEAD sha — the tape
+	@# says which commit, never which uncommitted edit, so a fixture from a local build is labelled
+	@# approximately rather than falsely precisely.
+	docker build -t $(BOT_IMAGE) \
+	  --build-arg VEXA_IMAGE_VERSION=$$(git -C $(REPO_ROOT) rev-parse --short HEAD 2>/dev/null || echo unknown) \
+	  -f $(REPO_ROOT)/core/meetings/services/bot/Dockerfile $(REPO_ROOT)
 	@_rt=$$($(COMPOSE) ps -q runtime 2>/dev/null); _live=""; \
 	 [ -n "$$_rt" ] && _live=$$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' $$_rt 2>/dev/null \
 	   | grep '^BROWSER_IMAGE=' | cut -d= -f2-); \
@@ -149,6 +172,11 @@ bot:
 ## _bot_check — FAIL LOUD if the meeting bot image isn't built locally. The bot is built here, never
 ## pulled (the published vexaai/vexa-bot:dev is the old 0.10 line). Without this the failure was silent:
 ## bots sat in `requested` and the meeting was reaped to `completed`/0-segments. Now it is screamingly visible.
+##
+## BOT_CHECK_STRICT=1 turns the warning into a non-zero EXIT (used by `dev` — an aborted build must never
+## leave a stack that spawns dead bots with no signal, #718 C4). `up` calls it warn-only (the published
+## image is pulled elsewhere), so the shared default stays a warning. Check-and-instruct only — it prints
+## the `make bot` / `docker pull` line and NEVER forces a 3.6GB pull mid-`make dev`.
 _bot_check:
 	@_bi=$$(grep -E '^BROWSER_IMAGE=' .env 2>/dev/null | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$$//; s/[[:space:]]+$$//'); \
 	 if [ -n "$$_bi" ] && ! docker image inspect "$$_bi" >/dev/null 2>&1; then \
@@ -163,6 +191,7 @@ _bot_check:
 	   echo "      Bots will FAIL TO JOIN until the image exists."; \
 	   echo "═══════════════════════════════════════════════════════════"; \
 	   echo ""; \
+	   if [ -n "$(BOT_CHECK_STRICT)" ]; then exit 1; fi; \
 	 fi
 
 ## _creds_check — WARN (never fail) when .env leaves a capability unconfigured: empty STT creds mean
@@ -193,8 +222,51 @@ _creds_check:
 	   echo "═══════════════════════════════════════════════════════════"; \
 	   echo ""; \
 	 fi
+## migrate-storage — upgrading a stack that ran MinIO: copy every object from the old MinIO into the
+## `storage` service and verify each one by SHA-256 (deploy/storage/migrate-from-minio.sh + s3_copy.py,
+## run with the meeting-api image's Python). Resumable; deletes nothing; the old volume is only read.
+## It reads through the old `minio` container while Compose still runs it as an orphan, else through a
+## temporary MinIO started from that container's image, else LEGACY_MINIO_IMAGE if it is on this
+## machine (nothing is pulled). Credentials default to the .env MINIO_* values, which both servers use.
+## Guide: docs/docs/upgrade-from-minio.mdx.
+LEGACY_MINIO_CONTAINER ?= $(PROJECT)-minio-1
+LEGACY_MINIO_VOLUME    ?= $(PROJECT)_minio-data
+LEGACY_MINIO_IMAGE     ?=
+# Empty uses MINIO_BUCKET from .env (or vexa); overrides both migration bucket defaults.
+MIGRATE_BUCKET        ?=
+migrate-storage:
+	@set -e; \
+	envv() { grep -E "^$$1=" .env 2>/dev/null | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$$//; s/[[:space:]]+$$//'; }; \
+	AK=$$(envv MINIO_ACCESS_KEY); AK=$${AK:-vexa-access-key}; SK=$$(envv MINIO_SECRET_KEY); SK=$${SK:-vexa-secret-key}; \
+	BK="$(MIGRATE_BUCKET)"; BK=$${BK:-$$(envv MINIO_BUCKET)}; BK=$${BK:-vexa}; TAG=$$(envv IMAGE_TAG); TAG=$${IMAGE_TAG:-$${TAG:-dev}}; \
+	$(COMPOSE) up -d --no-build storage; \
+	NETWORK=$(PROJECT)_vexa LEGACY_VOLUME=$(LEGACY_MINIO_VOLUME) LEGACY_CONTAINER=$(LEGACY_MINIO_CONTAINER) \
+	LEGACY_IMAGE="$(LEGACY_MINIO_IMAGE)" LEGACY_ACCESS_KEY="$${LEGACY_MINIO_ACCESS_KEY:-$$AK}" \
+	LEGACY_SECRET_KEY="$${LEGACY_MINIO_SECRET_KEY:-$$SK}" LEGACY_BUCKET="$${LEGACY_MINIO_BUCKET:-$$BK}" \
+	TARGET_ENDPOINT=http://storage:9000 TARGET_ACCESS_KEY="$$AK" TARGET_SECRET_KEY="$$SK" TARGET_BUCKET="$$BK" \
+	STORAGE_VOLUME=$(PROJECT)_storage-data RUN_IMAGE="vexaai/v012-meeting-api:$$TAG" RUN_PYTHON=python \
+	TOOLS_DIR=$(REPO_ROOT)/deploy/storage NAME_PREFIX=$(PROJECT) RETRY_HINT="make -C deploy/compose migrate-storage" \
+	COPY_ARGS="$(COPY_ARGS)" $(REPO_ROOT)/deploy/storage/migrate-from-minio.sh
+
+## down — remove containers and the network; keep all data volumes.
 down:
+	$(COMPOSE) down --remove-orphans
+
+## destroy — explicitly delete this stack's data volumes, including the database and recordings.
+destroy:
+ifeq ($(DESTROY),yes)
 	$(COMPOSE) down -v --remove-orphans
+	@echo "Deleted stack volumes: $(PROJECT)_redis-data $(PROJECT)_postgres-data $(PROJECT)_storage-data $(PROJECT)_agent-workspaces"
+else
+	@echo "Refusing to delete data volumes. Use make destroy DESTROY=yes to delete the database, recordings, Redis data and agent workspaces."
+	@exit 1
+endif
+
+help:
+	@echo "  make up                         # pull and start the stack"
+	@echo "  make down                       # stop/remove containers; keep data volumes"
+	@echo "  make destroy DESTROY=yes        # delete stack data volumes (database, recordings, Redis, agent workspaces)"
+	@echo "  make migrate-storage            # copy and verify recordings from an older MinIO install"
 
 ## _access — wait for admin-api, mint the self-host API key, print it + the URLs (used by `up`).
 _access:

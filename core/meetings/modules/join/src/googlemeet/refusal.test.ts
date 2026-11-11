@@ -48,7 +48,8 @@ function fixture(plan: Attempt[]) {
     locator: (selector: string) => ({
       count: async () => admitted && selector === '[data-self-name]' ? 1 : 0,
       evaluateAll: async () => 0,
-      first: () => ({ isVisible: async () => visible(selector), getAttribute: async () => null }),
+      first: () => ({ isVisible: async () => visible(selector), getAttribute: async () => null,
+        elementHandle: async () => visible(selector) ? handle(selector) : null }),
     }),
     frames: () => [],
   };

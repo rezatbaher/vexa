@@ -60,6 +60,40 @@ def _require_config(env: "os._Environ | dict | None" = None) -> None:
     preflight(env)
 
 
+# How many users a calendar sweep syncs at once. Users are independent, so the tick's wall time
+# tracks concurrency rather than the number of connected feeds; the bound keeps the DB pool and
+# the outbound feed fetches inside the budget a handful of users would already use.
+CALENDAR_SYNC_CONCURRENCY = 4
+
+
+async def _sync_user_calendars(store, redis_client, user_id: int, configs: list,
+                               *, publish=None, client=None) -> list:
+    """Sync ONE user's calendar connections and return their ACTIVE connections' stamps.
+
+    The user's meeting rows are read ONCE here and threaded through every connection —
+    ``sync_user`` keeps the list current as it writes, so a second calendar sees the first one's
+    inserts without a second full read. Each connection's stamp is persisted under its own key,
+    exactly as the per-connection panel reads it.
+
+    Every config passed in IS synced, tombstones included — that empty-feed pass is how a deleted
+    connection's sources get stripped and its rows retired. But a tombstone's stamp is neither
+    persisted nor RETURNED: the returned list is what ``aggregate_stamps`` turns into the
+    user-visible ``calendars[]`` roster, and a connection the user deleted has no place in it."""
+    from .calendar_sync import run_user_sync, store_stamp
+
+    rows = await store.list_meetings(user_id)
+    stamps = []
+    for cfg in configs:
+        stamp = await run_user_sync(store, cfg, publish=publish, rows=rows, client=client)
+        if cfg.get("deleted"):
+            continue
+        stamp["calendar_id"] = cfg.get("calendar_id")
+        stamp["calendar_name"] = cfg.get("calendar_name")
+        await store_stamp(redis_client, user_id, stamp, cfg.get("calendar_id"))
+        stamps.append(stamp)
+    return stamps
+
+
 def build_production_app():
     """Wire the unified meeting-api with the real adapters + the lifespan-driven loops."""
     _require_config()  # A4: refuse to boot a misconfigured deploy (no ADMIN_TOKEN → every spawn 500s).
@@ -102,6 +136,9 @@ def build_production_app():
 
     runtime_http = httpx.AsyncClient(timeout=30.0)
     runtime_client = HttpRuntimeClient(runtime_http, runtime_api_url)
+    from .service_authority import build_service_authority_from_env
+
+    service_authority = build_service_authority_from_env()
 
     recording_repo = SqlAlchemyRecordingRepo(session_factory)
     storage = S3Storage(
@@ -124,6 +161,16 @@ def build_production_app():
             return await client.post(url, content=body, headers=headers)
 
     webhook_sink = WebhookSink(_webhook_transport, queue=RetryQueue(redis_client))
+    from .webhooks import build_system_webhook_from_env
+
+    system_webhook_sink = build_system_webhook_from_env(redis_client)
+
+    # #841: the per-user delivery ledger — the queryable record GET /webhooks/deliveries serves.
+    # A per-user capped Redis list; the lifecycle callback records each delivery outcome so the
+    # dashboard's Delivery History reflects real deliveries, not just its own Test button.
+    from .webhooks import RedisDeliveryLedger
+
+    delivery_ledger = RedisDeliveryLedger(redis_client)
 
     # Completion finalization: when the lifecycle FSM lands on a terminal status the callback runs
     # this — flush the meeting's remaining redis segments to Postgres (threshold 0) + persist the
@@ -131,25 +178,28 @@ def build_production_app():
     # the next db-writer tick happens to run`).
     from .collector.db_writer import finalize_meeting
 
-    async def _transcript_finalizer(meeting_id: int) -> None:
-        await finalize_meeting(redis_client, transcript_store, meeting_id)
+    async def _transcript_finalizer(meeting_id: int) -> int:
+        return await finalize_meeting(redis_client, transcript_store, meeting_id)
 
     # Calendar-sync user edges (GET/POST /user/calendar/sync): the SAME one-user pass the
     # background sweep runs, on demand — paste-a-feed gets an immediate result instead of a
     # silent wait for the next tick (fail loud to the user). None-returns mean "no feed / sync
     # unavailable" and the route answers 404/503 accordingly.
-    async def _calendar_sync_now(user_id: int):
+    async def _calendar_sync_now(user_id: int, calendar_id: str | None = None):
         admin_api_url = (os.getenv("ADMIN_API_URL") or "").rstrip("/")
         internal_secret = os.getenv("INTERNAL_API_SECRET") or ""
         if not (admin_api_url and internal_secret):
             return None
         import json as _json
 
-        from .calendar_sync import fetch_configs, run_user_sync, store_stamp
+        from .calendar_sync import (active_configs, aggregate_stamps, fetch_configs,
+                                    store_stamp)
 
         configs = await fetch_configs(admin_api_url, internal_secret)
-        cfg = next((c for c in configs or [] if c.get("user_id") == user_id), None)
-        if cfg is None:
+        # ACTIVE connections only — a deleted one is the background sweep's to retire, never a feed
+        # the user can sync and never a roster the response names. None here → the route's 404.
+        selected = active_configs(configs, user_id, calendar_id)
+        if not selected:
             return None
 
         async def _pub(uid, entry):
@@ -161,19 +211,25 @@ def build_production_app():
             except Exception:
                 pass
 
-        stamp = await run_user_sync(transcript_store, cfg, publish=_pub)
-        await store_stamp(redis_client, user_id, stamp)
-        return stamp
+        stamps = await _sync_user_calendars(
+            transcript_store, redis_client, user_id, selected, publish=_pub,
+        )
+        if calendar_id is not None:
+            return stamps[0]
+        aggregate = aggregate_stamps(stamps)
+        await store_stamp(redis_client, user_id, aggregate)
+        return aggregate
 
-    async def _calendar_sync_status(user_id: int):
+    async def _calendar_sync_status(user_id: int, calendar_id: str | None = None):
         from .calendar_sync import read_stamp
-        return await read_stamp(redis_client, user_id)
+        return await read_stamp(redis_client, user_id, calendar_id)
 
     app = create_app(
         transcript_store=transcript_store,
         redis=segment_bus,
         meeting_repo=meeting_repo,
         runtime=runtime_client,
+        service_authority=service_authority,
         recording_repo=recording_repo,
         storage=storage,
         token_secret=token_secret,
@@ -181,6 +237,8 @@ def build_production_app():
         # redis.asyncio's client satisfies the CommandPublisher port directly (async publish()).
         command_publisher=redis_client,
         webhook_sink=webhook_sink,
+        system_webhook_sink=system_webhook_sink,
+        delivery_ledger=delivery_ledger,
         transcript_finalizer=_transcript_finalizer,
         calendar_sync_now=_calendar_sync_now,
         calendar_sync_status=_calendar_sync_status,
@@ -188,7 +246,10 @@ def build_production_app():
 
     _attach_background_loops(
         app, transcript_store, segment_bus, redis_client, meeting_repo, runtime_client,
+        service_authority=service_authority,
+        system_webhook_sink=system_webhook_sink,
         session_factory=session_factory,
+        storage=storage,
     )
     return app
 
@@ -204,7 +265,7 @@ def _minio_endpoint_url() -> str:
 
 def _attach_background_loops(
     app, transcript_store, segment_bus, redis_client, meeting_repo=None, runtime=None,
-    session_factory=None,
+    service_authority=None, system_webhook_sink=None, session_factory=None, storage=None,
 ) -> None:
     """Register the FastAPI lifespan that starts/stops the control-plane poll loops.
 
@@ -237,6 +298,11 @@ def _attach_background_loops(
     db_writer_interval = float(
         os.getenv("DB_WRITER_INTERVAL_S", os.getenv("BACKGROUND_TASK_INTERVAL", "10"))
     )
+    # #893: the self-healing keyspace SCAN is OFF the 10s hot path. The active_meetings set is
+    # authoritative in steady state, so a tick sweeps the set alone; the O(keyspace) scan that
+    # self-heals a set/hash divergence runs only on startup + every this-many seconds. The per-tick
+    # scan saturated redis and starved /health, restarting healthy pods.
+    db_writer_reconcile_interval = float(os.getenv("DB_WRITER_RECONCILE_INTERVAL_S", "300"))
     # Stop-reconcile backstop: a meeting whose bot was told to leave but never sent its own terminal
     # callback would stay `stopping` forever. After a grace window, complete it through the same
     # lifecycle callback the bot uses — so the FSM, webhook, and ws status frame all fire identically.
@@ -244,17 +310,32 @@ def _attach_background_loops(
     stop_interval = float(os.getenv("STOP_RECONCILE_INTERVAL_S", "15"))
     # GENERAL reconcile: ANY non-terminal status whose bot is gone (its row quiet past the grace) is
     # converged to a terminal state through the same lifecycle callback. `stopping` uses stop_grace
-    # (a stop was requested); `active`/etc. use `active_grace`. The active-reap is ADDITIONALLY gated on
-    # runtime WORKLOAD liveness (reconcile.py `_bot_workload_gone`): a meeting whose bot workload is still
+    # (a stop was requested); `active`/etc. use `active_grace`. The reap is ADDITIONALLY gated on
+    # runtime WORKLOAD liveness (reconcile.py `_probe_bot_workload`): a meeting whose bot workload is still
     # alive is NEVER reaped, even past the grace — so a quiet-but-live (silent) bot is safe regardless of
     # this window. With that gate in place, 300s is a SANE default again (the 86400 env stopgap, which
     # only worked because it disabled the time-based reap entirely, is no longer needed).
     active_grace = float(os.getenv("RECONCILE_ACTIVE_GRACE_S", "300"))
+    # A bot that has NOT yet reached the meeting gets its OWN, longer window (#862). The control plane
+    # hands every spawn a lobby budget (`waitingRoomTimeout`) and the bot reports `awaiting_admission`
+    # exactly ONCE before polling silently for the rest of it — so a HEALTHY bot waiting to be let in
+    # is indistinguishable from a dead one for the whole wait, and OUR patience has to outlast the
+    # deadline WE issued. Hence a floor DERIVED from that budget (+60s of headroom for the bot's own
+    # terminal callback to land) rather than a second number free to drift under it. The liveness
+    # gate is the primary defence; this is the belt for an inconclusive probe.
+    from .lifecycle.reconcile import default_preactive_grace
+
+    preactive_grace = float(
+        os.getenv("RECONCILE_PREACTIVE_GRACE_S", str(default_preactive_grace()))
+    )
     # Bounded untracked escalation (the zombie-loop fix): a meeting whose workload stays UNTRACKED
     # (runtime 404) CONTINUOUSLY past this window — no runtime re-adoption, no bot callback — is
     # presumed lost (runtime restart on the process backend / external removal) and advanced to
     # `failed` with the evidence note, instead of retrying an error + dead DELETE every sweep forever.
     untracked_grace = float(os.getenv("MEETING_UNTRACKED_GRACE_SEC", "600"))
+    service_authority_interval = float(
+        os.getenv("SERVICE_AUTHORITY_SWEEP_INTERVAL_S", "15")
+    )
 
     # #527: per-loop liveness heartbeats. A loop hung inside an await stops stamping, so /health can
     # SEE a dead consumer that would otherwise look alive (live WS keeps flowing on a SEPARATE path —
@@ -311,16 +392,25 @@ def _attach_background_loops(
         if not hasattr(transcript_store, "upsert_segments"):
             return  # a store without a durable sink (bare fake) — nothing to flush into
 
-        async def _tick():
-            await db_writer_tick(redis_client, transcript_store)
+        # #893: reconcile (the O(keyspace) self-healing scan) only on the FIRST tick — catch any
+        # mid-upgrade orphan hash on boot — then at most every db_writer_reconcile_interval seconds.
+        # Every other tick sweeps the authoritative active_meetings set alone, no scan.
+        last_reconcile = [0.0]  # 0 ⇒ the first tick reconciles
+
+        async def _tick(reconcile: bool):
+            await db_writer_tick(redis_client, transcript_store, reconcile=reconcile)
 
         while True:
+            now = _time.monotonic()
+            do_reconcile = (now - last_reconcile[0]) >= db_writer_reconcile_interval
             try:
-                await _guarded("db-writer", _tick)  # #637: one flush per interval across replicas
+                await _guarded("db-writer", lambda: _tick(do_reconcile))  # #637: one flush/interval
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("db-writer tick failed")
+            if do_reconcile:
+                last_reconcile[0] = now  # bound the scan cadence per replica, run or guarded-skip
             ticks["db-writer"] = _time.monotonic()  # #527: alive this iteration
             await asyncio.sleep(db_writer_interval)
 
@@ -340,6 +430,8 @@ def _attach_background_loops(
 
         async def _tick():
             await drain_retry_queue(redis_client, _transport)
+            if system_webhook_sink is not None:
+                await system_webhook_sink.drain()
 
         while True:
             try:
@@ -388,7 +480,7 @@ def _attach_background_loops(
                 await reconcile_stale_nonterminal_sweep(
                     meeting_repo, runtime, _post_lifecycle,
                     stop_grace=stop_grace, active_grace=active_grace, log=log,
-                    untracked_grace=untracked_grace,
+                    preactive_grace=preactive_grace, untracked_grace=untracked_grace,
                 )
             await reconcile_stale_stopping_sweep(
                 meeting_repo, runtime, _post_lifecycle, stop_grace=stop_grace, log=log,
@@ -403,6 +495,41 @@ def _attach_background_loops(
                 log.exception("stop-reconcile tick failed")
             await asyncio.sleep(stop_interval)
 
+    async def _service_authority_loop() -> None:
+        if (
+            service_authority is None
+            or not getattr(service_authority, "configured", False)
+            or meeting_repo is None
+            or runtime is None
+        ):
+            return
+        from .service_authority import run_service_authority_sweep
+
+        async def _tick():
+            observation = await run_service_authority_sweep(
+                meeting_repo,
+                runtime,
+                service_authority,
+            )
+            if observation.faults:
+                log.warning(
+                    "service-authority sweep faults=%s decisions=%s "
+                    "teardowns_confirmed=%s",
+                    observation.faults,
+                    observation.decisions,
+                    observation.teardowns_confirmed,
+                )
+
+        while True:
+            try:
+                await _guarded("service-authority", _tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("service-authority sweep failed")
+            ticks["service-authority"] = _time.monotonic()
+            await asyncio.sleep(service_authority_interval)
+
     # Auto-join: "scheduled" means the bot joins. The sweep spawns a bot for every scheduled row
     # whose data.scheduled_at arrived (lead window) and whose auto_join toggle is on, through the
     # SAME request_bot flow POST /bots runs — the claim/upgrade branch makes it idempotent. The
@@ -410,8 +537,12 @@ def _attach_background_loops(
     # is fetched from admin-api's internal edge. Fail-closed: unset ADMIN_API_URL/INTERNAL_API_SECRET
     # makes the cap unresolvable, so the sweep REFUSES to spawn (AUTO_JOIN_ALLOW_UNCAPPED=1 is the
     # explicit self-host opt-in); an UNREACHABLE identity likewise skips the tick.
+    from .bot_spawn.auto_join import DEFAULT_LEAD_S
+
     auto_join_interval = float(os.getenv("AUTO_JOIN_SWEEP_INTERVAL_S", "30"))
-    auto_join_lead = float(os.getenv("AUTO_JOIN_LEAD_S", "60"))
+    # The DEFAULT lives in one place (``auto_join.DEFAULT_LEAD_S``) so the sweep's own default and
+    # the entrypoint's env fallback can never drift apart. Deploy values may still override it.
+    auto_join_lead = float(os.getenv("AUTO_JOIN_LEAD_S", str(DEFAULT_LEAD_S)))
     auto_join_grace = float(os.getenv("AUTO_JOIN_GRACE_S", "600"))
     auto_join_backoff = float(os.getenv("AUTO_JOIN_RETRY_BACKOFF_S", "300"))
     admin_api_url = (os.getenv("ADMIN_API_URL") or "").rstrip("/")
@@ -427,25 +558,9 @@ def _attach_background_loops(
             return
         import json as _json
 
-        import httpx
-
         from .bot_spawn.auto_join import auto_join_tick
 
-        fetch_bot_context = None
-        if admin_api_url and internal_secret:
-            async def fetch_bot_context(user_id: int):
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        r = await client.get(
-                            f"{admin_api_url}/internal/users/{user_id}/bot-context",
-                            headers={"X-Internal-Secret": internal_secret},
-                        )
-                    if r.status_code != 200:
-                        return None
-                    body = r.json()
-                    return body if isinstance(body, dict) else None
-                except Exception:
-                    return None  # identity unreachable → the sweep skips the row this tick
+        fetch_bot_context = _bot_context_fetcher(admin_api_url, internal_secret)
 
         async def publish_status(*, user_id, meeting_id, native_id, status, when):
             frame = {"type": "meeting.status", "meeting_id": meeting_id,
@@ -458,6 +573,7 @@ def _attach_background_loops(
         async def _tick():
             await auto_join_tick(
                 meeting_repo, runtime,
+                authority=service_authority,
                 fetch_bot_context=fetch_bot_context,
                 publish_status=publish_status,
                 lead_s=auto_join_lead, grace_s=auto_join_grace,
@@ -499,17 +615,38 @@ def _attach_background_loops(
             return
         if not hasattr(transcript_store, "create_planned_meeting"):
             return
-        from .calendar_sync import fetch_configs, run_user_sync, store_stamp
+        from .calendar_sync import (aggregate_stamps, build_ics_client, fetch_configs,
+                                    store_stamp)
 
         async def _tick():
             configs = await fetch_configs(admin_api_url, internal_secret)
+            by_user: dict[int, list[dict]] = {}
             for cfg in configs or []:
-                try:  # one bad feed never stalls the sweep
-                    stamp = await run_user_sync(transcript_store, cfg, publish=_cal_publish)
-                except Exception:
-                    log.exception("calendar sync failed for user %s", cfg.get("user_id"))
-                    continue
-                await store_stamp(redis_client, cfg["user_id"], stamp)
+                by_user.setdefault(cfg["user_id"], []).append(cfg)
+            if not by_user:
+                return
+            limit = asyncio.Semaphore(CALENDAR_SYNC_CONCURRENCY)
+
+            async def _one_user(user_id: int, user_configs: list, client) -> None:
+                async with limit:
+                    try:  # one bad user never stalls the sweep
+                        stamps = await _sync_user_calendars(
+                            transcript_store, redis_client, user_id, user_configs,
+                            publish=_cal_publish, client=client,
+                        )
+                    except Exception:
+                        log.exception("calendar sync failed for user %s", user_id)
+                        return
+                    if stamps:
+                        await store_stamp(redis_client, user_id, aggregate_stamps(stamps))
+
+            # ONE pinned client for the whole tick: every feed fetch shares its connection pool
+            # instead of paying a fresh TLS handshake per calendar.
+            async with build_ics_client() as client:
+                await asyncio.gather(*(
+                    _one_user(user_id, user_configs, client)
+                    for user_id, user_configs in by_user.items()
+                ))
 
         while True:
             try:
@@ -521,6 +658,77 @@ def _attach_background_loops(
                 log.exception("calendar sync tick failed")
             await asyncio.sleep(calendar_interval)
 
+    # Captured-signal tape budget (O-TEL-1). Fixture collection is default ON, so the bound lives on
+    # the KEEP side: this sweep is the only thing standing between "every prod meeting tapes" and an
+    # object store that grows without limit. It deletes ONLY under the `signal/` prefix, and only
+    # tapes carrying no PROMOTED marker — recordings are never within its reach.
+    signal_janitor_interval = float(os.getenv("SIGNAL_TAPE_JANITOR_INTERVAL_S", "900"))
+    signal_min_age_s = float(os.getenv("SIGNAL_TAPE_MIN_AGE_S", "600"))
+
+    async def _signal_tape_janitor_loop() -> None:
+        if storage is None:
+            return  # no object store wired (Lite without MinIO) → nothing to sweep
+        from .recordings import DEFAULT_BUDGET_BYTES, sweep_signal_tapes
+
+        budget_bytes = int(os.getenv("SIGNAL_TAPE_BUDGET_BYTES") or DEFAULT_BUDGET_BYTES)
+
+        async def _tick():
+            await sweep_signal_tapes(
+                storage, budget_bytes=budget_bytes, min_age_s=signal_min_age_s,
+            )
+
+        while True:
+            try:
+                # #637: single-flight. The sweep both LISTS a whole prefix (a real S3 cost) and
+                # DELETES — two replicas racing would pay the listing twice and could try to delete
+                # the same tape's parts concurrently.
+                await _guarded("signal-tape-janitor", _tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("signal tape janitor tick failed")
+            await asyncio.sleep(signal_janitor_interval)
+
+    async def _ensure_fts_index_once() -> None:
+        """F191 / MIGRATION-0006 — ``ensure_fts_index`` (adapters.py, ``SqlAlchemyTranscriptStore``)
+        built the transcript FTS GIN index and was never called from anywhere: it shipped defined,
+        dead, and search ran a sequential scan of ``transcriptions`` from day one with nothing
+        reporting the gap.
+
+        A ONE-SHOT task, not a ``while True`` loop like its siblings above: the function's own
+        docstring already establishes it is idempotent and cheap to re-check ("safe to call on
+        every boot"), so one attempt per process lifetime is the right shape — the loop members
+        above poll because their work recurs (new segments, new webhooks); this index does not.
+        Fired here rather than folded into meeting-api's synchronous boot path for the same reason
+        the docstring gives: ``CREATE INDEX CONCURRENTLY`` cannot run inside admin-api's
+        ``ensure_schema`` transaction, and a plain (non-concurrent) build would hold
+        ``ACCESS EXCLUSIVE`` on the highest-row-count table for the whole build and stall startup.
+
+        Single-flighted like the other sweeps (not because a concurrent build corrupts anything —
+        ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` is itself safe under a race — but so
+        ``replicaCount>1`` does not have every replica open its own AUTOCOMMIT connection and hold
+        it for the full build). ``hasattr`` guards a fake/Lite transcript_store the same way
+        ``upsert_segments``/``create_planned_meeting`` are guarded above — this branch's only real
+        store is ``SqlAlchemyTranscriptStore``, but eval/test doubles that construct this function
+        with something else must not crash on a method they were never given.
+        """
+        if not hasattr(transcript_store, "ensure_fts_index"):
+            return
+
+        async def _tick():
+            result = await transcript_store.ensure_fts_index()
+            log.info("transcript FTS index: %s", result)
+
+        try:
+            await _guarded("ensure-fts-index", _tick)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "ensure_fts_index failed — transcript search falls back to a sequential scan "
+                "until the next boot retries it"
+            )
+
     @asynccontextmanager
     async def lifespan(_app):
         tasks = [
@@ -528,8 +736,14 @@ def _attach_background_loops(
             asyncio.create_task(_db_writer_loop(), name="db-writer"),
             asyncio.create_task(_webhook_drain_loop(), name="webhook-drain"),
             asyncio.create_task(_stop_reconcile_loop(), name="stop-reconcile"),
+            asyncio.create_task(
+                _service_authority_loop(),
+                name="service-authority",
+            ),
             asyncio.create_task(_auto_join_loop(), name="auto-join"),
             asyncio.create_task(_calendar_sync_loop(), name="calendar-sync"),
+            asyncio.create_task(_signal_tape_janitor_loop(), name="signal-tape-janitor"),
+            asyncio.create_task(_ensure_fts_index_once(), name="ensure-fts-index"),
         ]
         log.info("meeting-api background loops started: %s", [t.get_name() for t in tasks])
         try:
@@ -551,6 +765,40 @@ def __getattr__(name: str):
     if name == "app":
         return build_production_app()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+
+def _bot_context_fetcher(admin_api_url: str, internal_secret: str):
+    """The per-user spawn context from identity for the AUTO-JOIN SWEEP, or None when no identity
+    edge is configured.
+
+    The sweep needs its own fetcher because it spawns bots OUTSIDE a request — it stands in for the
+    headers the gateway would have injected, and it caches one answer per user across a whole tick.
+
+    NOT USED BY `POST /bots` any more. The direct path used to be handed this same builder so the
+    person's default name reached it too, which made that one request fetch
+    `/internal/users/{id}/bot-context` TWICE: once here at 10s for the name, once inside
+    `bot_spawn/service.request_bot` at 5s for the transcription backend and the capture-signal
+    decision — up to +15s on a path a person is waiting on, for one string. `request_bot` reads the
+    name out of the context it already has. Both paths still resolve the same value from the same
+    door, which is what the founder ruling required; there is just one call per spawn.
+    """
+    if not admin_api_url or not internal_secret:
+        return None
+    import httpx as _httpx
+
+    async def fetch(user_id: int):
+        try:
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"{admin_api_url}/internal/users/{user_id}/bot-context",
+                    headers={"X-Internal-Secret": internal_secret},
+                )
+            return r.json() if r.status_code == 200 else None
+        except Exception:  # noqa: BLE001 — a preference read never stops a bot joining
+            return None
+
+    return fetch
 
 
 def main() -> None:

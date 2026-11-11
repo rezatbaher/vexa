@@ -19,14 +19,54 @@ import type { BotStatus, LifecycleEvent, Act, TranscriptSegment } from './contra
  *  platform's many failure modes translated into the bot's vocabulary). */
 export type JoinOutcome = 'admitted' | 'rejected' | 'timeout' | 'blocked' | 'auth_missing' | 'error';
 
+/** A join verdict that CARRIES its human reason text. A non-admitted platform failure is born with
+ *  a message (the @vexa/join AdmissionError text: "auth_required: …", "host did not start …") — but
+ *  the bare `JoinOutcome` enum throws that message away, so the orchestrator's terminal `failed`
+ *  used to arrive with `completion_reason` set and `reason` NULL, and meeting-api synthesized the
+ *  uninformative "Bot exited with code N; reason: None" (#926). A driver MAY return this instead of
+ *  a bare outcome to pass the real cause all the way to the lifecycle row. */
+export interface JoinResult {
+  outcome: JoinOutcome;
+  /** The human cause text (e.g. the AdmissionError message). Rides onto lifecycle.v1 `reason`. */
+  reason?: string;
+  /** The measurements + platform signal behind the verdict (#1059/#1058). Optional: a driver that
+   *  supplies none still produces a classified terminal, just a less precise one. */
+  signals?: JoinSignals;
+}
+
+/** What the join attempt OBSERVED, as opposed to what it concluded (#1059, #1058).
+ *
+ *  The verdict enum alone cannot tell a ~20s platform refusal from a ~13min lobby expiry — both
+ *  arrive as a non-admission — so the two production populations collapsed into one label. These
+ *  are the measurements that separate them, gathered by the driver (the only layer holding a clock
+ *  that starts when navigation does) and classified by `join-evidence.ts`.
+ *
+ *  Every field is optional and every consumer treats absence as "not measured", never as zero: a
+ *  fabricated timing is worse than a missing one. */
+export interface JoinSignals {
+  /** ms from join start to the FIRST lobby/`awaiting_admission` report. Absent ⇒ never got there. */
+  timeToLobbyMs?: number;
+  /** ms spent waiting in the lobby before the verdict landed. */
+  timeInLobbyMs?: number;
+  /** ms from join start to the verdict — the "time to death" #1058 measured in production. */
+  totalMs?: number;
+  /** The lobby budget the control plane ISSUED for this run (`automaticLeave.waitingRoomTimeout`).
+   *  A wait is only an expiry relative to the deadline we ourselves handed the bot. */
+  lobbyBudgetMs?: number;
+  /** Did the bot ever observe the waiting room? `false` is a POSITIVE finding (it was on the page
+   *  and no lobby appeared), distinct from `undefined` (nobody looked). */
+  reachedLobby?: boolean;
+  /** The raw platform signal that triggered the verdict — the DOM state or the thrown message. */
+  detail?: string;
+}
+
 /** Drives the platform join. The real adapter wraps @vexa/join.joinMeeting + admission
  *  watchers + the removal monitor over a @vexa/remote-browser page. */
 export interface JoinDriver {
   /** Join + await admission. `report` fires on each intermediate lifecycle state
-   *  (awaiting_admission / needs_help / active). Resolves with the verdict. */
-  join(report: (s: BotStatus) => void | Promise<void>): Promise<JoinOutcome>;
-  /** Safe typed provider detail for the terminal lifecycle reason, when available. */
-  failureReason?(): string | undefined;
+   *  (awaiting_admission / needs_help / active). Resolves with the verdict — a bare `JoinOutcome`
+   *  or a `JoinResult` that also carries the failure's human reason text (#926). */
+  join(report: (s: BotStatus) => void | Promise<void>): Promise<JoinOutcome | JoinResult>;
   /** Watch for being removed from the meeting while active; returns a stop fn. */
   onRemoval(cb: () => void): () => void;
   /** Watch for the meeting EMPTYING OUT (every other participant left) while active; returns a
@@ -40,6 +80,12 @@ export interface JoinDriver {
    *  ask-to-join (Teams/Meet have a Cancel affordance) and, as a guaranteed drop, close the page so
    *  the request is abandoned even where no cancel button is reachable. Best-effort; never throws. */
   withdraw(reason: string): Promise<void>;
+  /** The `JoinSignals` as of the last join attempt's exit (#1059). OPTIONAL — a driver that does not
+   *  measure simply reports less. It exists because the two paths that lose a `JoinResult` entirely
+   *  still need evidence: a non-`AdmissionError` THROW (its stack unwinds past every return) and a
+   *  pre-active ABORT (the user stopped us mid-lobby, so the join never returns at all). MUST NOT
+   *  throw — the orchestrator calls it while already handling a failure. */
+  lastSignals?(): JoinSignals | undefined;
 }
 
 /** The capture → lane → STT → transcript/recording engine. The orchestrator starts/stops
@@ -54,6 +100,12 @@ export interface Pipeline {
  *  adapter publishes them to the redis stream / bus consumed by the collector. */
 export interface TranscriptSink {
   publish(segment: TranscriptSegment): Promise<void>;
+  /** Withdraw previously-published segments by id. The mixed lane republishes its pending tail as a
+   *  FULL-REPLACE block; when an id drops out of that block (confirmed under a new id, tail shrank, or
+   *  turn closed) it must be actively retracted, because the collector's stream is append-only and the
+   *  terminal upserts by id — without this a stale pending draft lingers as a duplicate. Optional so
+   *  lanes/adapters that don't produce retractable drafts (or test fakes) need not implement it. */
+  retract?(segmentIds: string[]): Promise<void>;
 }
 
 /** The reachability verdict of the FIRST (load-bearing) lifecycle emit (#530). `reachable` iff
@@ -89,6 +141,11 @@ export interface ControlPlaneProbe {
  *  unsubscribe fn. */
 export interface ActsSource {
   subscribe(handler: (act: Act) => void | Promise<void>): () => void;
+}
+
+/** Active-phase aloneness verdict source. Missing capture fails closed inside the adapter. */
+export interface AlonenessSource {
+  onAlone(callback: () => void): () => void;
 }
 
 /** recording.v1 sink — accumulates capture chunks and assembles the master. The real

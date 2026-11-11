@@ -115,13 +115,60 @@ async def test_db_writer_tick_is_idempotent_and_upserts_rewrites(store, bus, red
     assert _durable_texts(store) == ["polished"]
 
 
-async def test_db_writer_discovers_hash_missing_from_active_set(store, redis_c):
-    """Self-healing discovery: a hash written before the sweep set existed (mid-upgrade) is still
-    found by the key scan and drained."""
+async def test_db_writer_discovers_hash_missing_from_active_set_only_on_reconcile(store, redis_c):
+    """Self-healing discovery (#893): a hash written before the sweep set existed (mid-upgrade) — NO
+    sadd, so it is invisible to the authoritative ``active_meetings`` set — is drained by the
+    ``meeting:*:segments`` key scan. That scan is now OFF the per-tick hot path: a plain tick
+    (``reconcile=False``) does NOT find the orphan; only a ``reconcile=True`` tick does."""
     seg = {**_seg("s9", 3.0, "orphaned"), "updated_at": "2026-06-20T09:00:00Z"}
-    await redis_c.hset(segments_hash_key(1), "s9", json.dumps(seg))  # NO sadd
-    assert await db_writer_tick(redis_c, store, now=LATER) == 1
+    await redis_c.hset(segments_hash_key(1), "s9", json.dumps(seg))  # NO sadd → not in active_meetings
+
+    # hot path — the set-only sweep never scans the keyspace, so the orphan is NOT discovered.
+    assert await db_writer_tick(redis_c, store, now=LATER) == 0
+    assert _durable_texts(store) == []
+
+    # reconcile tick — the self-healing scan runs and drains it (the intent, preserved off the hot path).
+    assert await db_writer_tick(redis_c, store, now=LATER, reconcile=True) == 1
     assert _durable_texts(store) == ["orphaned"]
+
+
+class _ScanCountingRedis:
+    """Forwards every call to the wrapped client but COUNTS ``scan_iter`` invocations — the direct
+    proof that the O(keyspace) ``meeting:*:segments`` SCAN is off the db-writer hot path (#893). The
+    per-tick scan was the #1 redis command in prod (31.6M calls), saturating redis and starving the
+    bounded /health PING/XINFO/XPENDING past the 5s probe timeout, restarting healthy pods."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.scan_calls = 0
+
+    def scan_iter(self, *args, **kwargs):
+        self.scan_calls += 1
+        return self._inner.scan_iter(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def test_hot_tick_does_not_scan_keyspace_reconcile_does(store, bus, redis_c):
+    """#893 bounded-behavior: a plain db-writer tick issues ZERO keyspace scans while still flushing
+    the active-set meetings (the set is authoritative — ``append_segment`` SADDs atomically with the
+    hash write). The self-healing scan fires ONLY on a reconcile tick. This is the saturation fix:
+    N hot ticks cost 0 scans instead of N, so a busy redis no longer starves the health probe."""
+    await bus.xadd("transcription_segments", json.loads(_message(1, [_seg("s1", 0.0, "hello")])["payload"]))
+    assert await consume_segments(store, bus) == 1
+
+    spy = _ScanCountingRedis(redis_c)
+
+    # Many hot ticks: the set is swept every time, the keyspace SCAN never runs.
+    for _ in range(20):
+        await db_writer_tick(spy, store, now=LATER)
+    assert spy.scan_calls == 0
+    assert _durable_texts(store) == ["hello"]  # set-only discovery still flushes durably
+
+    # A reconcile tick is the ONLY place the O(keyspace) scan is paid.
+    await db_writer_tick(spy, store, now=LATER, reconcile=True)
+    assert spy.scan_calls == 1
 
 
 # ── (b) the flipped incident — redis wiped after the flush ──────────────────────────────────────
@@ -172,6 +219,67 @@ async def test_mutable_tail_stays_in_redis_until_it_settles(store, bus, redis_c)
     assert "1" in members                                   # stays in the sweep set for the next tick
     doc = await store.get_transcript(USER, "google_meet", NATIVE)
     assert [s["text"] for s in doc["segments"]] == ["fresh"]  # live read merge
+
+
+# ── M21: the hold is per-LANE, because only a lane that refines in place needs it ───────────────
+
+async def test_teams_csrc_confirmed_segment_flushes_without_waiting_out_the_hold(store, bus, redis_c):
+    """The Teams CSRC lane retracts drafts instead of refining rows in place, so a CONFIRMED
+    segment of its is durable-safe the moment it exists. Measured cost of
+    the old behaviour on prod meeting 26088: 36.2 s of a 39.4 s wait, against 2.0 s of model."""
+    seg = {**_seg("csrc-201:3:0", 1.0, "shipped now"), "source": "merged", "speaker_key": "csrc:201"}
+    await bus.xadd("transcription_segments", json.loads(_message(1, [seg])["payload"]))
+    await consume_segments(store, bus)
+
+    stored = await db_writer_tick(redis_c, store)  # real `now` — the segment is milliseconds old
+    assert stored == 1
+    assert _durable_texts(store) == ["shipped now"]
+
+
+async def test_teams_csrc_PENDING_still_waits_out_the_hold(store, bus, redis_c):
+    """A draft must never become a durable row: the durable read reports every stored row as
+    completed, so a flushed pending would read back as final until its retract caught up."""
+    seg = {**_seg("csrc-201:3:p0", 1.0, "still forming", completed=False), "source": "merged", "speaker_key": "csrc:201"}
+    await bus.xadd("transcription_segments", json.loads(_message(1, [seg])["payload"]))
+    await consume_segments(store, bus)
+
+    assert await db_writer_tick(redis_c, store) == 0
+    assert await redis_c.hlen(segments_hash_key(1)) == 1
+
+
+async def test_gmeet_lane_confirmed_segment_still_waits_out_the_hold(store, bus, redis_c):
+    """THE FALSIFIER. The gmeet lane republishes confirmed text under a rotated id and withdraws
+    the old row with EMPTY TEXT, which never deletes an already-flushed row — so its hold is the
+    only thing preventing an orphaned stale row, and this change must not touch it."""
+    seg = {**_seg("ch-1:5:1200", 1.0, "refined in place"), "source": "glow-bound"}
+    await bus.xadd("transcription_segments", json.loads(_message(1, [seg])["payload"]))
+    await consume_segments(store, bus)
+
+    assert await db_writer_tick(redis_c, store) == 0
+    assert await redis_c.hlen(segments_hash_key(1)) == 1
+    assert await flush_meeting_segments(redis_c, store, 1, now=LATER) == 1  # settles normally
+
+
+async def test_legacy_mixed_lane_confirmed_segment_keeps_the_hold(store, bus, redis_c):
+    """A source=merged row without a CSRC speaker key is Zoom/Jitsi legacy traffic and remains
+    outside the Teams-only release blast radius."""
+    seg = {**_seg("turn:3:0", 1.0, "legacy mixed"), "source": "merged"}
+    await bus.xadd("transcription_segments", json.loads(_message(1, [seg])["payload"]))
+    await consume_segments(store, bus)
+
+    assert await db_writer_tick(redis_c, store) == 0
+    assert await redis_c.hlen(segments_hash_key(1)) == 1
+
+
+async def test_finalize_still_flushes_everything_including_other_lanes(store, bus, redis_c):
+    """threshold_for never RAISES a caller's threshold — finalize (threshold 0) still takes the
+    whole tail, mixed pendings and gmeet rows included."""
+    await bus.xadd("transcription_segments", json.loads(_message(1, [
+        {**_seg("turn:9:p0", 1.0, "draft tail", completed=False), "source": "merged"},
+        {**_seg("ch-1:9:900", 2.0, "gmeet tail"), "source": "glow-bound"},
+    ])["payload"]))
+    await consume_segments(store, bus)
+    assert await flush_meeting_segments(redis_c, store, 1, immutability_threshold=0) == 2
 
 
 async def test_empty_text_segments_are_dropped_not_stored(store, redis_c):
@@ -446,3 +554,58 @@ async def test_rest_after_completion_with_redis_wiped_serves_transcript_and_proc
     assert [n["text"] for n in views[0]["doc"]["notes"]] == ["Closing words, cleaned."]
     assert views[0]["params"] == {"model": "claude-x"}
     assert_api_conforms("TranscriptionResponse", body)
+
+
+# ── A18: the drain's justification for being GONE was false, and this is the check ─────────────
+
+def test_the_processed_notes_producer_is_still_here():
+    """THE FINDING. The drain was deleted with the justification "PRD decision 34 removed the
+    producer: nothing writes that stream". On this candidate the producer is alive in all three of
+    its parts, so the claim was false and `data.processed.views[]` simply stopped being written —
+    the terminal's durable notes pane and the schedule digest's `notes` flag go permanently empty
+    the moment the bot stops, which is the exact bug the drain exists for.
+
+    Read from SOURCE, deliberately: this is a cross-domain claim about the AGENT domain (meetings ⊥
+    agent — no import, no call), and the only honest way to check "does anybody still write this
+    stream" is to look. If the producer is genuinely removed one day, this test fails and the drain
+    goes with it — in ONE change. A half-applied removal, in either direction, is the failure."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[5]
+    dispatch = (root / "core/agent/control_plane/dispatch.py").read_text()
+    engine = (root / "core/agent/worker/engine.py").read_text()
+    worker = (root / "core/agent/worker/meeting.py").read_text()
+
+    assert "VEXA_TRANSCRIPT_STREAM" in dispatch, (
+        "the meeting worker is no longer dispatched — if that is true, delete the drain too")
+    assert 'proc_stream=f"proc:meeting:{row_id}"' in engine, (
+        "the worker is no longer given a proc stream — if that is true, delete the drain too")
+    assert "stream.xadd(proc_stream, fields)" in worker, (
+        "nothing xadds cleaned notes any more — if that is true, delete the drain too")
+
+
+def test_the_drain_and_its_pending_re_drain_are_wired_into_the_tick_and_the_finalize():
+    """The two call sites the removal took out. Asserted from source rather than only through
+    behaviour, because the behavioural tests above pass a sink that implements the merge — and the
+    defect was that nothing ever CALLED it."""
+    import inspect
+
+    from meeting_api.collector import db_writer as dw
+
+    assert "flush_meeting_processed" in inspect.getsource(dw.db_writer_tick)
+    assert "PROC_PENDING_KEY" in inspect.getsource(dw.db_writer_tick)
+    assert "flush_meeting_processed" in inspect.getsource(dw.finalize_meeting)
+
+
+def test_the_grace_period_is_declared_config(monkeypatch):
+    """`PROC_PENDING_GRACE_SEC` is read from the environment, so gate:config-contract requires it in
+    meeting-api's declaration — an undeclared env read is a value an operator can set that reaches
+    nothing (or, here, one they cannot set at all)."""
+    import json
+    import pathlib
+
+    decl = json.loads((pathlib.Path(__file__).resolve().parents[1]
+                       / "src/meeting_api/config.v1.json").read_text())
+    entry = next((k for k in decl["keys"] if k["key"] == "PROC_PENDING_GRACE_SEC"), None)
+    assert entry is not None, "PROC_PENDING_GRACE_SEC is read by db_writer.py and declared nowhere"
+    assert entry["class"] == "defaulted" and entry["default"] == "120"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Render the v0.12 vexa chart (no cluster required) and assert the carved control plane is present:
-# 5 service Deployments, postgres + minio StatefulSets, redis, minio-init Job, runtime SA/Role/
-# RoleBinding (k8s backend), agent-workspaces PVC. This is the gate:helm static proof.
+# 5 service Deployments, the postgres StatefulSet, redis, runtime SA/Role/RoleBinding (k8s backend),
+# agent-workspaces PVC — and NO object store: recordings go to the operator's S3 (storage.s3), and
+# the storage guards refuse a render without it. This is the gate:helm static proof.
 set -euo pipefail
 
 HELM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,13 +24,12 @@ need() {  # need <count> <grep-pattern> <label>
 echo "=== gate:helm — template render assertions ==="
 # 6 long-running services (+ terminal) + redis = 7 Deployments
 need 7 '^kind: Deployment'    "Deployments"
-need 2 '^kind: StatefulSet'   "StatefulSets (postgres+minio)"
-need 9 '^kind: Service$'      "Services"
+need 1 '^kind: StatefulSet'   "StatefulSets (postgres)"
+need 8 '^kind: Service$'      "Services"
 need 1 'name: vexa-vexa-terminal' "terminal present"
 need 1 '^kind: ServiceAccount' "runtime ServiceAccount"
 need 1 '^kind: Role$'         "runtime Role"
 need 1 '^kind: RoleBinding'   "runtime RoleBinding"
-need 1 '^kind: Job'           "minio-init Job"
 need 2 '^kind: PersistentVolumeClaim' "PVCs (redis+workspaces)"
 need 1 'name: vexa-vexa-agent-api' "agent-api present"
 need 1 'RUNTIME_BACKEND'      "runtime backend env"
@@ -40,6 +40,11 @@ need 1 'serviceAccountName: vexa-vexa-runtime' "runtime SA bound"
 need 1 'key: CLAUDE_CODE_OAUTH_TOKEN' "agent-api CLAUDE_CODE_OAUTH_TOKEN secret ref"
 need 2 'key: ANTHROPIC_AUTH_TOKEN'    "ANTHROPIC_AUTH_TOKEN secret refs (agent-api + runtime)"
 need 2 'name: MEETING_API_URL' "MEETING_API_URL set on gateway AND meeting-api"
+# A terminating meeting-api must stay alive until EndpointSlice/kube-proxy stops routing its IP.
+# Without this drain, deleting co-located replicas produces immediate connection refusals even
+# while another replica remains Ready.
+need 1 'terminationGracePeriodSeconds: 30' "meeting-api termination budget rendered"
+need 1 '^[[:space:]]+- "sleep 5"$' "meeting-api preStop endpoint-drain delay rendered"
 # #677: agent-api MUST get VEXA_MEETING_API_URL or its live-SSE owner-lookup calls the compose-only
 # http://meeting-api:8080 (unresolvable in-cluster) → fail-closed 403 for the meeting's own owner.
 # Only agent-api carries the VEXA_-prefixed spelling, so assert exactly 1.
@@ -185,5 +190,366 @@ if grep -q 'image: "vexaai/dashboard:vSHOULD-NOT-APPLY"' <<< "$RENDER_DASH"; the
 else
   echo "  OK: dashboard image ignores global.imageTag (own pinned tag)"
 fi
+
+# #900 — the migrations Job must follow global.imageTag (it runs release code against the
+# schema; a rolling-v012 image on a pinned deploy is a schema/code skew). Opposite of the
+# dashboard: here global.imageTag MUST win over the meetingApi/migrations fallback tag.
+MIG_IMG="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set migrations.enabled=true --set global.imageTag=vMIGRATE \
+  --show-only templates/job-migrations.yaml | grep -E '^\s+image:')"
+if grep -qE ':vMIGRATE"?$' <<< "$MIG_IMG"; then
+  echo "  OK: migrations Job honors global.imageTag (pinned release image)"
+else
+  echo "  FAIL: migrations Job ignored global.imageTag — schema/code skew risk (#900): $MIG_IMG"; fail=1
+fi
+
+# F-D4 — the flows tier's Postgres host/port must resolve through the chart's shared
+# vexa.dbHostEffective/vexa.dbPortEffective resolvers, same as admin-api/meeting-api/
+# job-migrations — NOT a hardcoded in-cluster component name. Before the original fix this
+# rendered "...@vexa-vexa-postgres:5432/..." even with postgres.enabled=false and database.host
+# set, so the flows tier could never deploy against an external managed Postgres. F-D5 (below)
+# moved the DSN itself from a literal Secret string to a startup-composed one (DB_HOST/DB_PORT
+# discrete env vars, same shape admin-api uses) — these assertions now read those, not a literal
+# DSN string, but the underlying claim is the same one F-D4 made.
+FLOWS_EXT="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set flows.enabled=true --set postgres.enabled=false \
+  --set database.host=db.example.internal --set database.port=5432 \
+  --set postgres.credentialsSecretName=external-pg-creds \
+  --set agentApi.enabled=false --set terminal.enabled=false \
+  --show-only templates/flows.yaml)"
+if grep -A1 'name: DB_HOST' <<< "$FLOWS_EXT" | grep -q 'value: "db.example.internal"' \
+  && grep -A1 'name: DB_PORT' <<< "$FLOWS_EXT" | grep -q 'value: "5432"'; then
+  echo "  OK: flows tier DB_HOST/DB_PORT honor database.host/port under postgres.enabled=false (#F-D4)"
+else
+  echo "  FAIL: flows tier DB_HOST/DB_PORT did not resolve to the external database.host/port (#F-D4)"; fail=1
+fi
+if grep -q -- '-postgres' <<< "$FLOWS_EXT"; then
+  echo "  FAIL: flows tier still references an in-cluster '...-postgres' component name under postgres.enabled=false (#F-D4)"; fail=1
+else
+  echo "  OK: flows tier renders no in-cluster postgres component name under postgres.enabled=false (#F-D4)"
+fi
+FLOWS_DEFAULT="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set flows.enabled=true --show-only templates/flows.yaml)"
+if grep -A1 'name: DB_HOST' <<< "$FLOWS_DEFAULT" | grep -q 'value: "vexa-vexa-postgres"' \
+  && grep -A1 'name: DB_PORT' <<< "$FLOWS_DEFAULT" | grep -q 'value: "5432"'; then
+  echo "  OK: flows tier DB_HOST/DB_PORT unchanged under the default in-cluster postgres.enabled=true"
+else
+  echo "  FAIL: flows tier DB_HOST/DB_PORT changed meaning under default postgres.enabled=true"; fail=1
+fi
+
+# F-D5 — the flows tier installs on a production chart as the other services do (platform-adoption
+# scoping follow-up). Six items, checked against the SAME external/no-agent/no-terminal render
+# ($FLOWS_EXT above) unless noted:
+#
+# (1) DB credentials via the postgres-credentials Secret (secretKeyRef, same three keys admin-api
+#     reads: POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB) — never a chart value inlined into the
+#     rendered Secret. Before this, .Values.database.user/.Values.database.password (a decorative
+#     placeholder under postgres.enabled=false — the real credentials live only in the operator's
+#     pre-existing Secret) were baked into a literal DSN string.
+if grep -q 'postgres:postgres' <<< "$FLOWS_EXT"; then
+  echo "  FAIL: flows tier still inlines a literal database.user/password into the render (#F-D5.1)"; fail=1
+else
+  echo "  OK: flows tier renders no inline database.user/password literal (#F-D5.1)"
+fi
+if grep -B2 'key: POSTGRES_USER' <<< "$FLOWS_EXT" | grep -q 'name: "external-pg-creds"' \
+  && grep -B2 'key: POSTGRES_PASSWORD' <<< "$FLOWS_EXT" | grep -q 'name: "external-pg-creds"'; then
+  echo "  OK: flows tier sources DB_USER/DB_PASSWORD via secretKeyRef against postgres.credentialsSecretName (#F-D5.1)"
+else
+  echo "  FAIL: flows tier does not source DB_USER/DB_PASSWORD via the resolved credentials Secret (#F-D5.1)"; fail=1
+fi
+
+# (2) sslmode threads from database.sslMode into every composed DSN. Flows only — admin-api and
+#     meeting-api's own database modules have no DB_SSL_MODE/sslmode reader in current source (only
+#     job-migrations sets that env var, and nothing appears to consume it there either), so adding
+#     it to their Deployments would not be the one-line, provably-safe change threading it into
+#     flows's own DSN query string is.
+if grep -A1 'name: DB_SSL_MODE' <<< "$FLOWS_EXT" | grep -q 'value: "disable"' \
+  && grep -q 'sslmode=\${DB_SSL_MODE}' <<< "$FLOWS_EXT"; then
+  echo "  OK: flows tier threads database.sslMode into its composed DSNs (#F-D5.2)"
+else
+  echo "  FAIL: flows tier does not thread database.sslMode into its composed DSNs (#F-D5.2)"; fail=1
+fi
+
+# (3) the ensure-db bootstrap connection targets the APPLICATION database (database.name, via
+#     DB_NAME/POSTGRES_DB secretKeyRef) rather than Postgres's own "postgres" maintenance
+#     database — many managed Postgres offerings do not expose that database to the app's own
+#     role, but the application database is guaranteed to exist and be reachable (every other
+#     service already depends on it). Checked against the default render, where flows.databaseName
+#     ("flows") differs from database.name ("vexa") so the initContainer actually renders.
+if grep -B2 'key: POSTGRES_DB' <<< "$FLOWS_DEFAULT" | grep -q 'name: "postgres-credentials"'; then
+  echo "  OK: ensure-db bootstrap connection targets the application database via POSTGRES_DB secretKeyRef (#F-D5.3)"
+else
+  echo "  FAIL: ensure-db bootstrap connection does not target the application database (#F-D5.3)"; fail=1
+fi
+
+# (4) VEXA_FLOWS_AGENT_API_URL omitted (no agent Service in a no-agents estate) — flows_config.py
+#     declares it a `capability` key: unset means "no agent domain", not a URL pointed at nothing.
+if grep -q 'VEXA_FLOWS_AGENT_API_URL' <<< "$FLOWS_EXT"; then
+  echo "  FAIL: flows tier still renders VEXA_FLOWS_AGENT_API_URL under agentApi.enabled=false (#F-D5.4)"; fail=1
+else
+  echo "  OK: flows tier omits VEXA_FLOWS_AGENT_API_URL under agentApi.enabled=false (#F-D5.4)"
+fi
+if grep -q 'VEXA_FLOWS_AGENT_API_URL' <<< "$FLOWS_DEFAULT"; then
+  echo "  OK: flows tier still renders VEXA_FLOWS_AGENT_API_URL under the default agentApi.enabled=true (#F-D5.4)"
+else
+  echo "  FAIL: flows tier lost VEXA_FLOWS_AGENT_API_URL under the default agentApi.enabled=true (#F-D5.4)"; fail=1
+fi
+
+# (5) VEXA_UI_URL omitted (a capability: unset = no link) when terminal.enabled=false — before this
+#     it always resolved to terminal.publicUrl or the in-cluster Service address regardless, a dead
+#     link in every mail a no-terminal deployment sends.
+if grep -q 'VEXA_UI_URL' <<< "$FLOWS_EXT"; then
+  echo "  FAIL: flows tier still renders VEXA_UI_URL under terminal.enabled=false (#F-D5.5)"; fail=1
+else
+  echo "  OK: flows tier omits VEXA_UI_URL under terminal.enabled=false (#F-D5.5)"
+fi
+if grep -q 'VEXA_UI_URL' <<< "$FLOWS_DEFAULT"; then
+  echo "  OK: flows tier still renders VEXA_UI_URL under the default terminal.enabled=true (#F-D5.5)"
+else
+  echo "  FAIL: flows tier lost VEXA_UI_URL under the default terminal.enabled=true (#F-D5.5)"; fail=1
+fi
+
+# (6) the ensure-db initContainer tolerates a pre-created database / a role with no CREATEDB: the
+#     create is attempted only when the database is absent, and a privilege failure re-checks once
+#     more (another replica, or a pre-created database, may already have it) before refusing loudly
+#     rather than crash-looping on a raw permission-denied traceback. Static proof only — no live
+#     cluster to actually withhold CREATEDB from a role and watch this branch execute.
+if grep -q 'does not exist and this role could' <<< "$FLOWS_DEFAULT" \
+  && grep -q 'already exists (created by another process)' <<< "$FLOWS_DEFAULT"; then
+  echo "  OK: ensure-db initContainer codes the CREATEDB-tolerant retry/refuse path (#F-D5.6)"
+else
+  echo "  FAIL: ensure-db initContainer is missing the CREATEDB-tolerant retry/refuse path (#F-D5.6)"; fail=1
+fi
+
+# flows.databaseName — default "flows" (nothing changes for anyone); set equal to database.name to
+# put the flows tables in the application's own database instead (the shape compose already runs —
+# its flows tables live in the shared vexa database, no separate CREATE DATABASE at all). Prod
+# reason: the db-backup CronJob dumps only the named application database, so a separate "flows"
+# database is unbacked-up. When the two names match, the ensure-db initContainer is skipped
+# entirely — nothing to create, the application database already exists by definition.
+FLOWS_SHARED_DB="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set flows.enabled=true --set flows.databaseName=vexa --show-only templates/flows.yaml)"
+if grep -A1 'name: FLOWS_DB_NAME' <<< "$FLOWS_SHARED_DB" | grep -q 'value: "vexa"'; then
+  echo "  OK: flows.databaseName=vexa renders FLOWS_DB_NAME=vexa on every composed DSN"
+else
+  echo "  FAIL: flows.databaseName=vexa did not render FLOWS_DB_NAME=vexa"; fail=1
+fi
+if grep -q 'ensure-db' <<< "$FLOWS_SHARED_DB"; then
+  echo "  FAIL: ensure-db initContainer still renders when flows.databaseName equals database.name (should be a no-op)"; fail=1
+else
+  echo "  OK: ensure-db initContainer is skipped when flows.databaseName equals database.name"
+fi
+if grep -q 'ensure-db' <<< "$FLOWS_DEFAULT"; then
+  echo "  OK: ensure-db initContainer still renders under the default flows.databaseName (\"flows\" != \"vexa\")"
+else
+  echo "  FAIL: ensure-db initContainer missing under the default flows.databaseName"; fail=1
+fi
+
+
+# ── 0.12.27 car 2 — A2 (gateway names the agent domain only when it is deployed) and A12 (the
+#    flows tier's own container is configured like the two beside it). These assert VALUES, not
+#    just key NAMES: every defect below rendered a key with the right name and the wrong content,
+#    and the name-only greps above all passed while the tier could not boot.
+
+# A2 — AGENT_API_URL is what puts `agent` in the gateway's present set, and the present set is
+# loaded strictly (a named domain with no routes.v1 manifest is a ManifestError at import, i.e. a
+# crash-loop). It was rendered unconditionally, so a chart with agentApi.enabled=false named a
+# Service that does not exist in that release. BOTH branches asserted.
+GW_NO_AGENT="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set agentApi.enabled=false --show-only templates/deployment-gateway.yaml)"
+if grep -q 'AGENT_API_URL' <<< "$GW_NO_AGENT"; then
+  echo "  FAIL: gateway still names AGENT_API_URL under agentApi.enabled=false — strict manifest load, crash-loop (#A2)"; fail=1
+else
+  echo "  OK: gateway omits AGENT_API_URL under agentApi.enabled=false (#A2)"
+fi
+GW_AGENT="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --show-only templates/deployment-gateway.yaml)"
+if grep -A1 'name: AGENT_API_URL' <<< "$GW_AGENT" | grep -q 'value: "http://vexa-vexa-agent-api:8100"'; then
+  echo "  OK: gateway names the agent-api Service under the default agentApi.enabled=true (#A2)"
+else
+  echo "  FAIL: gateway does not name the agent-api Service under the default agentApi.enabled=true (#A2)"; fail=1
+fi
+
+# A12.1 — VEXA_FLOWS_AGENT_API_URL was rendered as an EMPTY STRING exactly when the agent domain
+# WAS enabled, and flows' `_is_set` reads "" as unset: the guard and the value were inverted, so
+# every agent step answered not_present on an estate running agent-api. Value-level, both branches.
+if grep -A1 'name: VEXA_FLOWS_AGENT_API_URL' <<< "$FLOWS_DEFAULT" | grep -q 'value: "http://vexa-vexa-agent-api:8100"'; then
+  echo "  OK: flows names the agent-api Service when agentApi.enabled (not an empty string) (#A12)"
+else
+  echo "  FAIL: flows renders VEXA_FLOWS_AGENT_API_URL with no Service address — unset by any reader (#A12)"; fail=1
+fi
+
+# A12.2 — the flows-api container carries the doors and credentials the worker/mailbox carry.
+# VEXA_FLOWS_ADMIN_API_URL is required-explicit in flows' config.v1, so its absence was a boot
+# refusal, not a degrade. Asserted on the flows-api container specifically (the render is split at
+# the flows-api Deployment so a value on the worker cannot satisfy a claim about the api).
+# The flows-api DEPLOYMENT document alone. helm orders a render by install kind, not by source
+# order, so "everything after the first line naming flows-api" is the Service, not the Deployment —
+# and a claim about the api container would then be satisfied by the worker's env twenty lines
+# down. Select the document by its own kind + component label instead.
+FLOWS_API_ONLY="$(awk 'BEGIN{RS="\n---\n"} /kind: Deployment/ && /component: flows-api/' <<< "$FLOWS_DEFAULT")"
+for kv in \
+  'VEXA_FLOWS_ADMIN_API_URL|value: "http://vexa-vexa-admin-api:8001"' \
+  'VEXA_FLOWS_GATEWAY_URL|value: "http://vexa-vexa-gateway:8000"' \
+  'VEXA_FLOWS_API_HOST|value: "0.0.0.0"' ; do
+  k="${kv%%|*}"; v="${kv##*|}"
+  if grep -A1 "name: $k" <<< "$FLOWS_API_ONLY" | grep -qF "$v"; then
+    echo "  OK: flows-api carries $k = ${v#value: } (#A12)"
+  else
+    echo "  FAIL: flows-api is missing $k = ${v#value: } (#A12)"; fail=1
+  fi
+done
+if grep -q 'key: ADMIN_API_TOKEN' <<< "$FLOWS_API_ONLY"; then
+  echo "  OK: flows-api sources VEXA_FLOWS_ADMIN_KEY from the admin-token Secret (#A12)"
+else
+  echo "  FAIL: flows-api does not source VEXA_FLOWS_ADMIN_KEY (#A12)"; fail=1
+fi
+
+# A12.3 — probes on flows-api (it has a /health; the worker and mailbox have no server at all and
+# carry a rendered comment saying so).
+if grep -q 'livenessProbe' <<< "$FLOWS_API_ONLY" && grep -q 'readinessProbe' <<< "$FLOWS_API_ONLY"; then
+  echo "  OK: flows-api carries liveness + readiness probes on /health (#A12)"
+else
+  echo "  FAIL: flows-api carries no probes (#A12)"; fail=1
+fi
+
+# A12.4 — the flows image follows global.imageTag like every other service instead of a mutable
+# `:dev`, and an explicit flows.image still wins (that is how a publisher digest-pins a release).
+FLOWS_PINNED="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set flows.enabled=true --set global.imageTag=vPIN --show-only templates/flows.yaml)"
+if grep -q 'image: "vexaai/v012-flows:vPIN"' <<< "$FLOWS_PINNED" \
+  && ! grep -q 'v012-flows:dev' <<< "$FLOWS_PINNED"; then
+  echo "  OK: flows image honors global.imageTag (no mutable :dev left) (#A12)"
+else
+  echo "  FAIL: flows image ignored global.imageTag (#A12)"; fail=1
+fi
+FLOWS_OVERRIDE="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" \
+  --set flows.enabled=true --set global.imageTag=vPIN \
+  --set flows.image=reg.example/flows@sha256:abc --show-only templates/flows.yaml)"
+if grep -q 'image: "reg.example/flows@sha256:abc"' <<< "$FLOWS_OVERRIDE"; then
+  echo "  OK: an explicit flows.image still wins over global.imageTag (#A12)"
+else
+  echo "  FAIL: an explicit flows.image no longer wins over global.imageTag (#A12)"; fail=1
+fi
+
+# ── storage.s3 — recordings in the operator's own S3; the built-in MinIO is gone ─────────────────
+# The chart runs no object store: no MinIO workload, Service, PVC template, bucket Job or image in
+# the render, and no StatefulSet beyond postgres (asserted exactly, not >=).
+exact() {  # exact <count> <grep-pattern> <label> [render]
+  local want="$1" pat="$2" label="$3" got
+  got="$(printf '%s\n' "${4:-$RENDER}" | grep -cE "$pat" || true)"
+  if [ "$got" -eq "$want" ]; then echo "  OK: $label ($got)"; else echo "  FAIL: $label — want $want got $got"; fail=1; fi
+}
+exact 0 'component: minio' "no MinIO workload, Service or Job (component: minio)"
+exact 0 'image: .*(minio|/mc[:@])' "no MinIO server or client image"
+exact 0 'vexa-vexa-minio' "nothing addresses the old MinIO Service"
+exact 0 'minio-init' "no bucket-init Job"
+exact 1 '^kind: StatefulSet' "exactly one StatefulSet (postgres)"
+exact 0 '^kind: Job' "no Job in the default render (the bucket-init Job is gone)"
+# meeting-api's storage env comes from storage.s3, VALUE-level (values-test points at the fixture).
+MA="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" --show-only templates/deployment-meeting-api.yaml)"
+for kv in 'S3_ENDPOINT|value: "http://s3-fixture:7070"' 'MINIO_ENDPOINT|value: "http://s3-fixture:7070"' \
+          'MINIO_BUCKET|value: "vexa-recordings"' 'MINIO_SECURE|value: "false"' \
+          'STORAGE_BACKEND|value: "s3"' 'AWS_CONFIG_FILE|value: /etc/vexa/s3/config'; do
+  k="${kv%%|*}"; v="${kv##*|}"
+  if grep -A1 "name: $k\$" <<< "$MA" | grep -qF "$v"; then echo "  OK: meeting-api $k = ${v#value: }"
+  else echo "  FAIL: meeting-api $k is not ${v#value: }"; fail=1; fi
+done
+# Credentials only by secretKeyRef on storage.s3.existingSecret — never a literal value. Both name
+# pairs (S3_* and the MINIO_* keys the /health object_storage row is declared on) read the Secret.
+for k in S3_ACCESS_KEY MINIO_ACCESS_KEY; do
+  if grep -A5 "name: $k\$" <<< "$MA" | tr -d '\n' | grep -qE 'secretKeyRef:[[:space:]]+name: "s3-fixture-credentials"[[:space:]]+key: "AWS_ACCESS_KEY_ID"'; then
+    echo "  OK: $k from secretKeyRef s3-fixture-credentials/AWS_ACCESS_KEY_ID"
+  else echo "  FAIL: $k is not read from the storage.s3 Secret"; fail=1; fi
+done
+for k in S3_SECRET_KEY MINIO_SECRET_KEY; do
+  if grep -A5 "name: $k\$" <<< "$MA" | tr -d '\n' | grep -qE 'secretKeyRef:[[:space:]]+name: "s3-fixture-credentials"[[:space:]]+key: "AWS_SECRET_ACCESS_KEY"'; then
+    echo "  OK: $k from secretKeyRef s3-fixture-credentials/AWS_SECRET_ACCESS_KEY"
+  else echo "  FAIL: $k is not read from the storage.s3 Secret"; fail=1; fi
+done
+if grep -A1 -E 'name: (S3|MINIO)_(ACCESS|SECRET)_KEY$' <<< "$MA" | grep -q 'value:'; then
+  echo "  FAIL: a storage credential is rendered as a literal value"; fail=1
+else echo "  OK: no storage credential rendered as a literal value"; fi
+# The boto3 shared-config file: path-style by default, virtual when forcePathStyle=false, and a CA
+# bundle only when one is named (ConfigMap or Secret, mounted read-only at the path it names).
+CM="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" --show-only templates/configmap-s3-client.yaml)"
+if grep -q 'addressing_style = path' <<< "$CM" && grep -q 'region = us-east-1' <<< "$CM" && ! grep -q ca_bundle <<< "$CM"; then
+  echo "  OK: S3 client config defaults (path-style, us-east-1, system CAs)"
+else echo "  FAIL: S3 client config defaults wrong"; fail=1; fi
+CMV="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" --set storage.s3.forcePathStyle=false \
+  --set storage.s3.region=eu-central-1 --show-only templates/configmap-s3-client.yaml)"
+if grep -q 'addressing_style = virtual' <<< "$CMV" && grep -q 'region = eu-central-1' <<< "$CMV"; then
+  echo "  OK: forcePathStyle=false → virtual-hosted; region threads through"
+else echo "  FAIL: forcePathStyle=false / region not honored"; fail=1; fi
+CA="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" --set storage.s3.caBundle.configMapName=corp-ca \
+  --set storage.s3.caBundle.key=ca-bundle.crt)"
+if grep -q 'ca_bundle = /etc/vexa/s3-ca/ca.crt' <<< "$CA" && grep -A6 'name: s3-ca$' <<< "$CA" | grep -q 'name: "corp-ca"' \
+   && grep -q 'key: "ca-bundle.crt"' <<< "$CA" && grep -q 'mountPath: /etc/vexa/s3-ca' <<< "$CA"; then
+  echo "  OK: caBundle.configMapName mounts the bundle and names it in the client config"
+else echo "  FAIL: caBundle.configMapName not wired"; fail=1; fi
+CAS="$(helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" --set storage.s3.caBundle.secretName=corp-ca \
+  --show-only templates/deployment-meeting-api.yaml)"
+if grep -A3 'name: s3-ca$' <<< "$CAS" | grep -q 'secretName: "corp-ca"'; then
+  echo "  OK: caBundle.secretName mounts the bundle from a Secret"
+else echo "  FAIL: caBundle.secretName not wired"; fail=1; fi
+# A pinned MinIO-era values shape with MinIO OFF (the enterprise kit's rehearsal values) renders.
+if helm template vexa "$CHART" -n vexa -f "$CHART/values-test.yaml" --set minio.enabled=false >/dev/null 2>&1; then
+  echo "  OK: minio.enabled=false beside storage.s3 renders (MinIO-off values keep working)"
+else echo "  FAIL: minio.enabled=false beside storage.s3 does not render"; fail=1; fi
+
+# Render the Install command's actual --set flags, substituting only its generated secrets and
+# bucket placeholder. Parse the flags as data: never execute commands copied from the docs.
+INSTALL_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+INSTALL_ARGS=()
+while read -r flag value; do
+  INSTALL_ARGS+=("$flag" "$value")
+done < <(awk -v secret="$INSTALL_SECRET" '
+  /^helm install vexa / { install=1; next }
+  install && /^```/ { exit }
+  install {
+    sub(/[[:space:]]*\\$/, "")
+    gsub(/"\$\(openssl rand -hex 32\)"/, secret)
+    sub(/<your bucket>/, "b")
+    print
+  }
+' "$HELM_DIR/../../docs/docs/deployment-kubernetes.mdx")
+if INSTALL="$(helm template vexa "$CHART" -n vexa "${INSTALL_ARGS[@]}" 2>&1)" && [ -n "$INSTALL" ]; then
+  echo "  OK: documented Install command flags render successfully"
+  exact 0 'CHANGE_ME' "documented Install has no published admin token" "$INSTALL"
+  exact 4 "^  (ADMIN_API_TOKEN|INTERNAL_API_SECRET|VEXA_DISPATCH_SIGNING_KEY|NEXTAUTH_SECRET): \"$INSTALL_SECRET\"$" \
+    "documented Install supplies all four secrets" "$INSTALL"
+else
+  echo "  FAIL: documented Install command flags did not render: $INSTALL"; fail=1
+fi
+
+# Negative controls — each MUST fail to render, with the message that names the fix.
+refuse() {  # refuse <label> <expected-message-regex> <helm args...>
+  local label="$1" want="$2" out; shift 2
+  if out="$(helm template vexa "$CHART" -n vexa "$@" 2>&1)"; then
+    echo "  FAIL: $label — rendered, must refuse"; fail=1
+  elif grep -qE "$want" <<< "$out"; then echo "  OK: $label → refused with the actionable message"
+  else echo "  FAIL: $label — refused without the expected message: $(grep -m1 Error <<< "$out")"; fail=1; fi
+}
+refuse "no storage.s3 (chart defaults)" 'storage\.s3 is incomplete, missing: storage\.s3\.endpoint, storage\.s3\.bucket, storage\.s3\.existingSecret' \
+  --set secrets.internalApiSecret=x
+refuse "stale minio.enabled=true" 'minio\.enabled=true is no longer supported.*data-vexa-vexa-minio-0' \
+  -f "$CHART/values-test.yaml" --set minio.enabled=true
+refuse "endpoint without a scheme" 'storage\.s3\.endpoint must be a full URL' \
+  -f "$CHART/values-test.yaml" --set storage.s3.endpoint=minio:9000
+refuse "region with whitespace" 'storage\.s3\.region must be a region name such as us-east-1' \
+  -f "$CHART/values-test.yaml" --set 'storage.s3.region=us east'
+refuse "region with an INI injection" 'storage\.s3\.region must be a region name such as us-east-1' \
+  -f "$CHART/values-test.yaml" --set $'storage.s3.region=us-east-1\nca_bundle=/tmp/other-ca'
+refuse "no existingSecret" 'missing: storage\.s3\.existingSecret' \
+  -f "$CHART/values-test.yaml" --set storage.s3.existingSecret=
+refuse "CA bundle named twice" 'set configMapName or secretName, not both' \
+  -f "$CHART/values-test.yaml" --set storage.s3.caBundle.configMapName=a --set storage.s3.caBundle.secretName=b
+refuse "extraEnv still setting S3_ENDPOINT" 'meetingApi\.extraEnv sets S3_ENDPOINT' \
+  -f "$CHART/values-test.yaml" --set-json 'meetingApi.extraEnv=[{"name":"S3_ENDPOINT","value":"http://old"}]'
+for k in AWS_DEFAULT_REGION AWS_CA_BUNDLE AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE; do
+  refuse "extraEnv setting $k" \
+    "meetingApi\\.extraEnv sets $k, which the chart now sets from storage\\.s3\\. Put the value in storage\\.s3 and remove it from meetingApi\\.extraEnv\\." \
+    -f "$CHART/values-test.yaml" --set "meetingApi.extraEnv[0].name=$k" --set 'meetingApi.extraEnv[0].value=override'
+done
 
 [ "$fail" -eq 0 ] && { echo "gate:helm PASS"; exit 0; } || { echo "gate:helm FAIL"; exit 1; }

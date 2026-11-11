@@ -106,19 +106,38 @@ FROM vexa/meet-join-env:dev AS runtime
 # it back on clean teardown; without the binary every authenticated spawn fails
 # at session-restore. The Playwright + humanized-X11 stack (xvfb·xdotool·xclip·
 # x11vnc·websockify) comes from the base.
+# noble (#1011) dropped `awscli` from the archive — `apt-get install awscli` has no
+# installation candidate there, which broke this image the moment the base moved. AWS's
+# own v2 installer is the supported path on 24.04; it is the same binary the session
+# store shells out to, so nothing above this line changes.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
        pulseaudio \
        fluxbox \
        socat \
-       awscli \
+       ca-certificates \
+       curl \
+       unzip \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/aws /tmp/awscliv2.zip \
     && rm -rf /var/lib/apt/lists/* \
     && aws --version
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     DISPLAY=:99 \
     NODE_ENV=production
+
+# Which build this is. It is stamped into every captured-signal tape header and into each sidecar's
+# mini-header, because a prod fixture outlives the deployment that produced it: the same observation
+# ("the bot dropped the tail") means opposite things on either side of a fix, and a tape that cannot
+# name its build proves a behaviour it cannot attribute. The build passes the git sha
+# (`--build-arg VEXA_IMAGE_VERSION=$(git rev-parse --short HEAD)`); an unstamped image records
+# 'unknown', which is the honest answer rather than a guess.
+ARG VEXA_IMAGE_VERSION=unknown
+ENV VEXA_IMAGE_VERSION=${VEXA_IMAGE_VERSION}
 
 WORKDIR /app
 
