@@ -35,7 +35,7 @@ export type { S3Config } from './session-store';
 export { getAuthenticatedBrowserArgs, getBrowserSessionArgs, CDP_DEBUG_ARGS } from './args';
 
 // The one true persistent-context launch
-export { launchPersistentBrowser } from './browser';
+export { launchPersistentBrowser, browserPatchingEnabled, BROWSER_PATCHING_ENV } from './browser';
 export type { LaunchPersistentOptions } from './browser';
 // Re-export the Playwright handles this brick's API traffics in, so consumers (the bot
 // composition root + its adapters) type against ONE Page/BrowserContext without a direct

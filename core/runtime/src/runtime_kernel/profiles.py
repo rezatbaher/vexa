@@ -151,6 +151,9 @@ def default_registry() -> ProfileRegistry:
             "TTS_SERVICE_URL",
             "TTS_API_TOKEN",
             "MEETING_SPEECH_URL",
+            # Browser patching switch (remote-browser): "off" launches the bot's Chromium WITHOUT the stealth plugin and the
+            # fingerprint-spoof init script. Unset/any other value keeps the default (patching on).
+            "BOT_BROWSER_PATCHING",
         )
         if os.environ.get(key, "").strip()
     }

@@ -23,6 +23,11 @@ persisted (~200 KB), not the full profile.
 > NOT incognito (incognito wipes the stored cookies that make an authenticated join work). Session mode
 > additionally carries the CDP debug args so an agent can attach over the gateway proxy.
 
+> **Browser patching switch.** `BOT_BROWSER_PATCHING` (`on` by default) controls the anti-detection layer in
+> `launchPersistentBrowser`: `on` registers the puppeteer-extra stealth plugin (lazily, on a private
+> playwright-extra instance) and adds the fingerprint-spoof init script; `off` (`off`/`false`/`0`/`no`/`disabled`)
+> launches plain Playwright Chromium with the same launch options and no page scripts. Each launch logs the mode.
+
 ## Surface
 `provisionLogin` · `launchPersistentBrowser` · `validateLoggedIn` · `getAuthenticatedBrowserArgs` ·
 `getBrowserSessionArgs` · `CDP_DEBUG_ARGS` · session store (`syncBrowserDataFromS3`/`…ToS3`,

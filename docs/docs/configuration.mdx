@@ -28,6 +28,7 @@ are public.
 | `BOT_SPEAKER_CONFIRM_THRESHOLD` | `2` | Consecutive matching STT results required to confirm a segment. `1` lowers latency but reduces LocalAgreement protection against corrections. |
 | `BOT_SPEAKER_MAX_BUFFER_SEC` | `30` | Maximum buffered Google Meet audio before a forced submission. |
 | `BOT_SPEAKER_IDLE_TIMEOUT_SEC` | `15` | Flush/reset timeout after a speaker stops producing audio. |
+| `BOT_BROWSER_PATCHING` | `on` | Google Meet bot browser anti-detection layer. `on` applies the puppeteer-extra stealth plugin and the init-script fingerprint spoof (WebGL renderer, `deviceMemory`, `chrome.runtime`); `off` (also `false`, `0`, `no`, `disabled`) launches plain Chromium with the same flags and no page scripts. Forwarded to spawned bots. The bot logs the mode it launched in. |
 
 The STT service is the **GPU workload, deployed separately** from this stack — see
 [Deployment → Transcription](/deployment#transcription-the-separate-gpu-unit). The main stack

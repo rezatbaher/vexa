@@ -426,6 +426,15 @@
    ]
   },
   {
+   "key": "BOT_BROWSER_PATCHING",
+   "class": "defaulted",
+   "default": "on",
+   "description": "Meeting-bot browser anti-detection layer (stealth plugin + fingerprint-spoof init script): on keeps it, off launches plain Chromium; forwarded to spawned bots.",
+   "targets": [
+    "compose"
+   ]
+  },
+  {
    "key": "VEXA_NETWORK_SESSION_ENABLED",
    "class": "defaulted",
    "default": "false",

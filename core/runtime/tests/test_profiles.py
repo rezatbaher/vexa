@@ -199,3 +199,13 @@ def test_meeting_bot_forwards_whisper_streaming_endpoint_and_policy(monkeypatch)
     assert env["BOT_WHISPER_WS_URL"] == "ws://whisper-live:9090"
     assert env["BOT_WHISPER_MODEL"] == "large-v3-turbo"
     assert env["BOT_WHISPER_EARLY_FINAL"] == "false"
+
+
+def test_meeting_bot_forwards_the_browser_patching_switch(monkeypatch):
+    monkeypatch.setenv("BOT_BROWSER_PATCHING", "off")
+    assert default_registry().get("meeting-bot").base_env["BOT_BROWSER_PATCHING"] == "off"
+    # Unset or blank is not forwarded: the bot's own default (patching on) applies.
+    monkeypatch.delenv("BOT_BROWSER_PATCHING")
+    assert "BOT_BROWSER_PATCHING" not in default_registry().get("meeting-bot").base_env
+    monkeypatch.setenv("BOT_BROWSER_PATCHING", "  ")
+    assert "BOT_BROWSER_PATCHING" not in default_registry().get("meeting-bot").base_env
