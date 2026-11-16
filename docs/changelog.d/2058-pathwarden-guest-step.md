@@ -1,0 +1,1 @@
+- **Google Meet guest joining:** handle the visible Continue as guest step before entering the bot name, including a new attempt on the same browser page. Preserve the existing refusal budget, cancellation checks and trusted-input path. Adapted from upstream PR #2058; provider admission after this change remains unverified.

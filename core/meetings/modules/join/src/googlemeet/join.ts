@@ -3,6 +3,7 @@ import { log, randomDelay, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
 import {
   googleNameInputSelectors,
+  googleContinueAsGuestSelectors,
   googleJoinButtonSelectors,
   googleMicrophoneButtonSelectors,
   googleCameraButtonSelectors,
@@ -221,7 +222,8 @@ export async function waitForAnySelector(
   selectors: string[],
   timeoutMs: number,
   label: string,
-  guard?: () => Promise<void>
+  guard?: () => Promise<void>,
+  recordButtonsOnMiss = false
 ): Promise<{ handle: ElementHandle<Element>; selector: string }> {
   const started = Date.now();
   do {
@@ -236,7 +238,35 @@ export async function waitForAnySelector(
   } while (Date.now() - started < timeoutMs);
 
   await guard?.();
-  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, null));
+  // A miss is never blind: when asked, record the visible text-button labels (the same structural
+  // scan the lobby CTA wait uses; button labels only, never page text).
+  let labels: string[] | null = null;
+  if (recordButtonsOnMiss) {
+    try { labels = (await scanLobbyPrimaryCta(page)).labels; } catch { labels = null; }
+  }
+  throw new Error(await describeSelectorMiss(page, selectors, timeoutMs, label, labels));
+}
+
+/** Press the visible guest step at most once during each navigation. */
+const pressedGuestStep = new WeakSet<Page>();
+export async function pressContinueAsGuestIfPresent(
+  page: Page,
+  click: (handle: ElementHandle<Element>, label: string) => Promise<void>
+): Promise<boolean> {
+  if (pressedGuestStep.has(page)) return false;
+  const hit = await firstVisibleSelector(page, googleContinueAsGuestSelectors);
+  if (!hit) return false;
+  pressedGuestStep.add(page);
+  try {
+    await click(hit.handle, "continue_as_guest");
+  } catch (e) {
+    // A failed press must not change how the join ends: the wait carries on to its normal
+    // 120 s «Could not locate name input» miss (which monitoring counts and which records the labels).
+    log(`«Continue as guest» press failed (${e instanceof Error ? e.message.slice(0, 120) : "unknown"}); continuing the name-field wait.`);
+    return false;
+  }
+  log(`Pressed «Continue as guest» on the pre-join guest step (via ${hit.selector}).`);
+  return true;
 }
 
 /**
@@ -333,6 +363,7 @@ export async function joinGoogleMeeting(
     assertGoogleJoinActive(page, botConfig.joinSignal, botConfig.joinDeadline);
   };
   assertGoogleJoinActive(page, botConfig.joinSignal, botConfig.joinDeadline);
+  pressedGuestStep.delete(page);
   await page.goto(withPinnedMeetLocale(meetingUrl, resolveBotUiLocale()), {
     waitUntil: "domcontentloaded",
     timeout: Math.min(30000, Math.max(1, (botConfig.joinDeadline ?? Date.now() + 30000) - Date.now())),
@@ -489,7 +520,13 @@ export async function joinGoogleMeeting(
       page,
       googleNameInputSelectors,
       120000,
-      "name input", guard
+      "name input",
+      async () => {
+        await guard();
+        await pressContinueAsGuestIfPresent(page, clickHandle);
+        await guard();
+      },
+      true
     );
     log("Name input field found.");
 
