@@ -12,7 +12,7 @@ import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent } from "./
 import { prepareForRecording, leaveGoogleMeet } from "./googlemeet/leave";
 import { startGoogleRemovalMonitor } from "./googlemeet/removal";
 import { startGoogleAlonenessMonitor } from "./googlemeet/alone";
-import { knockUntilGoogleAccepts, assertGoogleJoinActive } from "./googlemeet/refusal";
+import { knockUntilGoogleAccepts, googleKnockConfig, assertGoogleJoinActive } from "./googlemeet/refusal";
 import { joinMicrosoftTeams } from "./msteams/join";
 import { waitForTeamsMeetingAdmission, checkForTeamsAdmissionSilent } from "./msteams/admission";
 import { prepareForRecording as prepareForTeamsRecording, leaveMicrosoftTeams } from "./msteams/leave";
@@ -130,12 +130,13 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
     const deadline = Date.now() + timeout;
     botConfig.joinSignal = opts.signal;
     botConfig.joinDeadline = deadline;
+    const knock = googleKnockConfig();
     admitted = await knockUntilGoogleAccepts(page, timeout, async () => {
       assertGoogleJoinActive(page, opts.signal, deadline);
       await joinGoogleMeeting(page, opts.meetingUrl, botConfig.botName!, botConfig);
       assertGoogleJoinActive(page, opts.signal, deadline);
       return waitForGoogleMeetingAdmission(page, Math.max(1, deadline - Date.now()), botConfig);
-    }, Date.now, opts.signal);
+    }, Date.now, { ...knock, freshen: !opts.authenticated && knock.wipe, signal: opts.signal });
   } else {
     // Explicit refusal, never a fallthrough: an unknown platform used to silently run the GOOGLE
     // MEET join flow against whatever URL it was handed — the wrong flow on the wrong site, failing

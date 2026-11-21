@@ -1,0 +1,3 @@
+# Google Meet refusal policy
+
+Port the Google Meet retry policy from upstream main 6b26f7b921756d6db128d42cd70b4b7046381407 into the compatible Pathwarden fork: ten bounded knocks by default, optional backoff and anonymous guest-state clearing. Preserve cancellation, the issued lobby deadline, strict Google RPC attribution, Continue as guest, and signed-in profile isolation. Runtime forwards only the three declared deployment settings. The default policy matches upstream: no extra wait and no state clearing. This is a bot join-policy update, not the upstream 0.13 full-stack migration; provider admission remains a live verification requirement.

@@ -140,6 +140,9 @@ def default_registry() -> ProfileRegistry:
             "BOT_WHISPER_MODEL",
             "BOT_WHISPER_EARLY_FINAL",
 
+            "VEXA_GOOGLE_JOIN_MAX_KNOCKS",
+            "VEXA_GOOGLE_REKNOCK_BACKOFF_MS",
+            "VEXA_GOOGLE_REKNOCK_WIPE",
             "BOT_ALONE_SILENCE_WINDOW_MS",
             "BOT_SPEAKER_MIN_AUDIO_SEC",
             "BOT_SPEAKER_SUBMIT_INTERVAL_SEC",

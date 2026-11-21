@@ -209,3 +209,14 @@ def test_meeting_bot_forwards_the_browser_patching_switch(monkeypatch):
     assert "BOT_BROWSER_PATCHING" not in default_registry().get("meeting-bot").base_env
     monkeypatch.setenv("BOT_BROWSER_PATCHING", "  ")
     assert "BOT_BROWSER_PATCHING" not in default_registry().get("meeting-bot").base_env
+
+
+def test_meeting_bot_forwards_google_knock_policy(monkeypatch):
+    values = {"VEXA_GOOGLE_JOIN_MAX_KNOCKS": "5", "VEXA_GOOGLE_REKNOCK_BACKOFF_MS": "1000,2000", "VEXA_GOOGLE_REKNOCK_WIPE": "true"}
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    env = default_registry().get("meeting-bot").base_env
+    assert {key: env[key] for key in values} == values
+    for key in values:
+        monkeypatch.setenv(key, "  ")
+    assert not set(values).intersection(default_registry().get("meeting-bot").base_env)

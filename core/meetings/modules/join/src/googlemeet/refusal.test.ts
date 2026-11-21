@@ -6,7 +6,7 @@ import { checkForWaitingRoomIndicators, waitForGoogleMeetingAdmission } from "./
 import { googleJoinButtonSelectors, googleNameInputSelectors, googleJoinRefusedIndicators } from "./selectors";
 import {
   GoogleJoinRefusedError, watchGoogleJoinRefusal, checkForGoogleJoinRefused,
-  knockUntilGoogleAccepts, assertGoogleJoinActive,
+  knockUntilGoogleAccepts, assertGoogleJoinActive, GOOGLE_JOIN_MAX_KNOCKS,
 } from "./refusal";
 
 type Attempt = "before" | "after" | "admit";
@@ -73,10 +73,10 @@ async function main() {
     checks++;
   }
   {
-    const page = fixture(["before", "before", "before"]);
+    const page = fixture(Array.from({ length: GOOGLE_JOIN_MAX_KNOCKS }, () => "before"));
     await assert.rejects(joinMeeting(page, opts), (e: any) =>
-      e instanceof GoogleJoinRefusedError && e.outcome === "denial" && e.message.includes("3 of 3"));
-    assert.equal(page.attempts(), 3);
+      e instanceof GoogleJoinRefusedError && e.outcome === "denial" && e.message.includes(`${GOOGLE_JOIN_MAX_KNOCKS} of ${GOOGLE_JOIN_MAX_KNOCKS}`));
+    assert.equal(page.attempts(), GOOGLE_JOIN_MAX_KNOCKS);
     checks++;
   }
   {
@@ -167,6 +167,18 @@ async function main() {
     await assert.rejects(waitForGoogleMeetingAdmission(page, 10000, {
       joinDeadline: Date.now() - 1,
     } as any), (error: any) => error instanceof AdmissionError && error.outcome === "lobby_timeout");
+    checks++;
+  }
+  {
+    const controller = new AbortController();
+    let knocks = 0, freshened = 0;
+    await assert.rejects(knockUntilGoogleAccepts({} as any, 10000, async () => {
+      knocks++; throw new GoogleJoinRefusedError("ResolveMeetingSpace answered HTTP 403");
+    }, Date.now, { signal: controller.signal, freshen: true, backoffMs: [1],
+      sleep: async () => { controller.abort(); }, freshenState: async () => { freshened++; },
+    }), (error: any) => error.name === "AbortError");
+    assert.equal(knocks, 1);
+    assert.equal(freshened, 0);
     checks++;
   }
   assert.throws(() => assertGoogleJoinActive({} as any, undefined, Date.now() - 1), AdmissionError);
