@@ -33,7 +33,7 @@ async function main() {
     const states: string[] = [];
     const result = await driver.join(async state => { states.push(state); });
     assert.equal(result.outcome, "rejected");
-    assert.equal(page.count(), 3);
+    assert.equal(page.count(), 10);
     assert.ok(result.reason?.startsWith("google_meet_join_refused:"));
     assert.deepEqual(states, []);
   }
